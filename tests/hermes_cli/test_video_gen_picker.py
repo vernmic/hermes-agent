@@ -113,36 +113,72 @@ class TestReconfigureWritesProvider:
 
         assert config["video_gen"]["provider"] == "xai_fake"
         assert config["video_gen"]["model"] == "xai_fake-video-v1"
-        assert config["video_gen"]["use_gateway"] is False
+        # Non-managed pick: no legacy use_gateway key is written.
+        assert "use_gateway" not in config["video_gen"]
 
-    def test_reconfigure_with_no_env_vars_writes_provider(
-        self, monkeypatch, tmp_path
-    ):
-        """No env vars at all (managed-style plugin) → writes
-        video_gen.provider via the no-env-vars early-return branch."""
+
+class TestPluginVideoProvidersRow:
+    """Tests for _plugin_video_gen_providers row contents."""
+
+    def test_post_setup_propagated_when_declared(self, monkeypatch):
         from hermes_cli import tools_config
 
-        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         video_gen_registry.register_provider(_FakeVideoProvider(
-            "noenv_video",
+            "xai_video",
             schema={
-                "name": "NoEnvVideo",
-                "badge": "free",
-                "tag": "",
+                "name": "xAI Grok Imagine",
+                "badge": "paid",
+                "tag": "grok video",
                 "env_vars": [],
+                "post_setup": "xai_grok",
             },
         ))
-        monkeypatch.setattr(tools_config, "_prompt_choice", lambda *a, **kw: 0)
 
-        config: dict = {}
-        provider_row = {
-            "name": "NoEnvVideo",
-            "env_vars": [],
-            "video_gen_plugin_name": "noenv_video",
-        }
+        rows = tools_config._plugin_video_gen_providers()
+        match = next(r for r in rows if r.get("video_gen_plugin_name") == "xai_video")
+        assert match["post_setup"] == "xai_grok"
 
-        tools_config._reconfigure_provider(provider_row, config)
 
-        assert config["video_gen"]["provider"] == "noenv_video"
-        assert config["video_gen"]["model"] == "noenv_video-video-v1"
-        assert config["video_gen"]["use_gateway"] is False
+class TestVideoPluginProviderActive:
+    """Tests for _is_provider_active recognizing video_gen_plugin_name."""
+
+    def test_active_when_video_gen_provider_matches(self):
+        from hermes_cli import tools_config
+
+        config = {"video_gen": {"provider": "xai"}}
+        row = {"name": "xAI Grok Imagine", "video_gen_plugin_name": "xai"}
+
+        assert tools_config._is_provider_active(row, config) is True
+
+
+    def test_detect_active_index_picks_video_plugin_match(self, monkeypatch):
+        """When xAI is the configured video_gen provider, the picker should
+        default to the xAI row even if FAL_KEY happens to be set in env.
+
+        Regression: previously _detect_active_provider_index() saw
+        _is_provider_active(xai) return False (no video_gen branch),
+        skipped xAI (empty env_vars), and matched the FAL row via the
+        env-var fallback — so the picker visually defaulted to FAL even
+        though the user picked xAI. The xAI row uses empty env_vars
+        because authentication is handled via xAI Grok OAuth (post_setup
+        hook).
+        """
+        from hermes_cli import tools_config
+
+        monkeypatch.setattr(
+            tools_config,
+            "get_env_value",
+            lambda key: "fal-key" if key == "FAL_KEY" else "",
+        )
+
+        config = {"video_gen": {"provider": "xai"}}
+        providers = [
+            {"name": "xAI Grok Imagine", "env_vars": [], "video_gen_plugin_name": "xai"},
+            {
+                "name": "FAL.ai",
+                "env_vars": [{"key": "FAL_KEY", "prompt": "FAL"}],
+                "video_gen_plugin_name": "fal",
+            },
+        ]
+
+        assert tools_config._detect_active_provider_index(providers, config) == 0

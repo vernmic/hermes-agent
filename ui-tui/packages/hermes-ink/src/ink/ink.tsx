@@ -16,8 +16,9 @@ import { logError } from '../utils/log.js'
 
 import { colorize } from './colorize.js'
 import App from './components/App.js'
+import type { CursorAdvanceNotifier } from './components/CursorAdvanceContext.js'
 import type { CursorDeclaration, CursorDeclarationSetter } from './components/CursorDeclarationContext.js'
-import { FRAME_INTERVAL_MS } from './constants.js'
+import { FRAME_INTERVAL_MS, MAX_COALESCED_BACKPRESSURE_FRAMES } from './constants.js'
 import * as dom from './dom.js'
 import { markDirty } from './dom.js'
 import { KeyboardEvent } from './events/keyboard-event.js'
@@ -76,6 +77,7 @@ import {
 } from './selection.js'
 import {
   needsAltScreenResizeScrollbackClear,
+  skipKittyKeyboardProtocol,
   supportsExtendedKeys,
   SYNC_OUTPUT_SUPPORTED,
   type Terminal,
@@ -96,9 +98,10 @@ import {
   DBP,
   DFE,
   DISABLE_MOUSE_TRACKING,
-  ENABLE_MOUSE_TRACKING,
+  enableMouseTrackingFor,
   ENTER_ALT_SCREEN,
   EXIT_ALT_SCREEN,
+  type MouseTrackingMode,
   SHOW_CURSOR
 } from './termio/dec.js'
 import {
@@ -203,6 +206,11 @@ export default class Ink {
   // (callback fired).
   private pendingWriteStart: number | null = null
   private lastDrainMs = 0
+  // Issue #31486: count of consecutive frames skipped because the previous
+  // write hadn't drained. Reset to 0 whenever a frame actually writes (or the
+  // pipe has drained). Capped by MAX_COALESCED_BACKPRESSURE_FRAMES so a
+  // never-firing drain callback can't coalesce forever.
+  private coalescedBackpressureFrames = 0
   private lastYogaCounters: {
     ms: number
     visited: number
@@ -266,9 +274,11 @@ export default class Ink {
   // LF-induced scroll when screen.height === terminalRows) and gates
   // alt-screen-aware SIGCONT/resize/unmount handling.
   private altScreenActive = false
-  // Set alongside altScreenActive so SIGCONT resume knows whether to
-  // re-enable mouse tracking (not all <AlternateScreen> uses want it).
-  private altScreenMouseTracking = false
+  // Set alongside altScreenActive so SIGCONT resume knows which mouse
+  // tracking preset to re-enable (not all <AlternateScreen> uses want
+  // tracking, and tmux users routinely opt into the hover-free 'wheel'
+  // subset to silence prompt-row clipboard probes).
+  private altScreenMouseTracking: MouseTrackingMode = 'off'
   // True when the previous frame's screen buffer cannot be trusted for
   // blit — selection overlay mutated it, resetFramesForAltScreen()
   // replaced it with blanks, or forceRedraw() reset it to 0×0. Forces
@@ -281,6 +291,12 @@ export default class Ink {
   // render() takes; deferring into the atomic block means old content stays
   // visible until the new frame is fully ready.
   private needsEraseBeforePaint = false
+  // Scopes the scrollback-deep erase (CSI 3J) to resize healing only. Apple
+  // Terminal preserves alt-screen reflow artifacts in scrollback across a
+  // resize, which is the one case worth clearing history for. Other erase
+  // requesters (focus regain) must stay 2J-only — wiping the user's
+  // scrollback on an ordinary tab switch is data loss, not recovery.
+  private needsDeepEraseBeforePaint = false
   // Native cursor positioning: a component (via useDeclaredCursor) declares
   // where the terminal cursor should be parked after each frame. Terminal
   // emulators render IME preedit text at the physical cursor position, and
@@ -484,17 +500,22 @@ export default class Ink {
   private handleResize = () => {
     const cols = this.options.stdout.columns || 80
     const rows = this.options.stdout.rows || 24
+    const dimsChanged = cols !== this.terminalColumns || rows !== this.terminalRows
 
-    // Terminals often emit 2+ resize events for one user action (window
-    // settling). Same-dimension events are no-ops; skip to avoid redundant
-    // frame resets and renders.
-    if (cols === this.terminalColumns && rows === this.terminalRows) {
+    // Terminals often emit 2+ resize events for one user action
+    // (window settling). Same-dimension events are usually no-ops,
+    // but in alt-screen mode a same-dimension resize can signal a
+    // terminal host reflow or buffer restore that leaves stale glyphs
+    // on the physical screen — treat it as a repaint signal.
+    if (!dimsChanged && !(this.altScreenActive && !this.isPaused && this.options.stdout.isTTY)) {
       return
     }
 
-    this.terminalColumns = cols
-    this.terminalRows = rows
-    this.altScreenParkPatch = makeAltScreenParkPatch(this.terminalRows)
+    if (dimsChanged) {
+      this.terminalColumns = cols
+      this.terminalRows = rows
+      this.altScreenParkPatch = makeAltScreenParkPatch(this.terminalRows)
+    }
 
     // Pending throttled/drain work captured stale dims — cancel so
     // the upcoming microtask owns the next frame.
@@ -521,26 +542,7 @@ export default class Ink {
     // doesn't exit alt-screen. Do NOT write ERASE_SCREEN: render() below
     // can take ~80ms; erasing first leaves the screen blank that whole time.
     if (this.altScreenActive && !this.isPaused && this.options.stdout.isTTY) {
-      if (this.altScreenMouseTracking) {
-        this.options.stdout.write(ENABLE_MOUSE_TRACKING)
-      }
-
-      this.resetFramesForAltScreen()
-      this.needsEraseBeforePaint = true
-
-      // One last repaint after the resize burst settles closes any host-side
-      // reflow drift the normal diff path can't see.
-      this.resizeSettleTimer = setTimeout(() => {
-        this.resizeSettleTimer = null
-
-        if (!this.canAltScreenRepaint()) {
-          return
-        }
-
-        this.resetFramesForAltScreen()
-        this.needsEraseBeforePaint = true
-        this.render(this.currentNode!)
-      }, 160)
+      this.prepareAltScreenResizeRepaint()
     }
 
     // Already queued: later events in this burst updated dims/alt-screen
@@ -573,6 +575,84 @@ export default class Ink {
     )
   }
 
+  private prepareAltScreenResizeRepaint(): void {
+    // Clear any pending settle timer from a previous resize burst so
+    // rapid events don't stack redundant delayed repaints. (handleResize
+    // also clears this, but the defensive clear keeps the method safe
+    // if it's ever called from other code paths.)
+    if (this.resizeSettleTimer !== null) {
+      clearTimeout(this.resizeSettleTimer)
+      this.resizeSettleTimer = null
+    }
+
+    // Mouse tracking — DISABLE first so we land in the exact preset state
+    // even if an external app/terminal/tmux left DEC 1003 hover asserted.
+    // DISABLE_MOUSE_TRACKING is idempotent (resets all four modes
+    // unconditionally), safe to send even when current preset is 'off'.
+    this.options.stdout.write(DISABLE_MOUSE_TRACKING + enableMouseTrackingFor(this.altScreenMouseTracking))
+
+    this.resetFramesForAltScreen()
+    this.needsEraseBeforePaint = true
+    this.needsDeepEraseBeforePaint = true
+
+    this.resizeSettleTimer = setTimeout(() => {
+      this.resizeSettleTimer = null
+
+      if (!this.canAltScreenRepaint()) {
+        return
+      }
+
+      this.resetFramesForAltScreen()
+      this.needsEraseBeforePaint = true
+      this.needsDeepEraseBeforePaint = true
+      this.render(this.currentNode!)
+    }, 160)
+  }
+
+  private handleTerminalFocusChange(isFocused: boolean): void {
+    if (!isFocused || !this.options.stdout.isTTY) {
+      return
+    }
+
+    // Focus-in means the terminal emulator has just made this tab/pane
+    // visible again. Some emulators throttle or coalesce hidden-tab output;
+    // if we continue with the pre-blur virtual cursor/backbuffer, only the
+    // next small dirty region may repaint and stale status/progress rows can
+    // remain visible. Defer one tick so TerminalFocusProvider subscribers
+    // observe the new focus state first, then reset the virtual frames and
+    // repaint from scratch.
+    //
+    // The clear is required (a row that is BLANK in the new frame is skipped
+    // by the diff, so a stale row survives a buffer-only reset), but it is
+    // queued via needsEraseBeforePaint rather than written directly: that
+    // folds it into this frame's patch list so clear+paint reach the terminal
+    // in ONE write. forceRedraw()'s separate stdout.write(ERASE_SCREEN) is
+    // what makes an ordinary tab switch flash a blank screen.
+    //
+    // Modes are re-asserted too: an emulator that dropped DEC mouse tracking
+    // while the pane was hidden would otherwise stay dead until the DECRQM
+    // watchdog's next 2s probe. reassertTerminalModes(false) is the
+    // non-destructive form — extended keys + mouse preset, no alt-screen
+    // re-entry, no erase — so it costs a few idempotent bytes and no flicker.
+    queueMicrotask(() => {
+      if (this.isUnmounted || this.isPaused || !this.options.stdout.isTTY || this.currentNode === null) {
+        return
+      }
+
+      this.reassertTerminalModes(false)
+
+      if (this.altScreenActive) {
+        this.resetFramesForAltScreen()
+      } else {
+        this.repaint()
+        this.invalidatePrevFrame()
+      }
+
+      this.needsEraseBeforePaint = true
+      this.onRender()
+    })
+  }
+
   resolveExitPromise: () => void = () => {}
   rejectExitPromise: (reason?: Error) => void = () => {}
   unsubscribeExit: () => void = () => {}
@@ -592,7 +672,7 @@ export default class Ink {
       // kitty/modifyOtherKeys stays active. exitAlternateScreen re-enables.
       DISABLE_KITTY_KEYBOARD +
         DISABLE_MODIFY_OTHER_KEYS +
-        (this.altScreenMouseTracking ? DISABLE_MOUSE_TRACKING : '') +
+        (this.altScreenMouseTracking !== 'off' ? DISABLE_MOUSE_TRACKING : '') +
         // disable mouse (no-op if off)
         (this.altScreenActive ? '' : '\x1b[?1049h') +
         // enter alt (already in alt if fullscreen)
@@ -628,7 +708,11 @@ export default class Ink {
         // clear screen (now alt if fullscreen)
         '\x1b[H' +
         // cursor home
-        (this.altScreenMouseTracking ? ENABLE_MOUSE_TRACKING : '') +
+        // DISABLE first so external editors/tmux that left DEC 1003 hover
+        // on can't survive the handoff back — same pattern as
+        // setAltScreenMouseTracking / reenterAltScreen.
+        DISABLE_MOUSE_TRACKING +
+        enableMouseTrackingFor(this.altScreenMouseTracking) +
         (this.altScreenActive ? '' : '\x1b[?1049l') +
         // exit alt (non-fullscreen only)
         '\x1b[?25l' // hide cursor (Ink manages)
@@ -650,7 +734,11 @@ export default class Ink {
     // without the pop we'd accumulate depth on each editor round-trip).
     this.options.stdout.write(
       '\x1b[?1004h' +
-        (supportsExtendedKeys() ? DISABLE_KITTY_KEYBOARD + ENABLE_KITTY_KEYBOARD + ENABLE_MODIFY_OTHER_KEYS : '')
+        (supportsExtendedKeys()
+          ? DISABLE_KITTY_KEYBOARD +
+            (skipKittyKeyboardProtocol() ? '' : ENABLE_KITTY_KEYBOARD) +
+            ENABLE_MODIFY_OTHER_KEYS
+          : '')
     )
   }
   onRender() {
@@ -676,6 +764,36 @@ export default class Ink {
       clearTimeout(this.drainTimer)
       this.drainTimer = null
     }
+
+    // Issue #31486 (stdout-backpressure strand): if the PREVIOUS frame's
+    // stdout.write still hasn't drained (callback hasn't fired —
+    // pendingWriteStart is non-null), the outer terminal is consuming bytes
+    // slower than we're producing them. Piling another write on the backed-up
+    // pipe is wasted work AND keeps the macrotask queue hot, which is what
+    // starves the stdin 'readable' callback and wedges input. Coalesce:
+    // skip this frame's render+write entirely and retry on the drain tick.
+    // The ceiling guarantees forward progress — after N coalesced frames we
+    // force the write through, so a terminal whose drain callback NEVER fires
+    // (e.g. OSError EIO on flush) self-heals once the pipe recovers instead of
+    // coalescing forever. Only on a TTY; piped stdout has no flow control and
+    // pendingWriteStart is never set there.
+    if (
+      this.options.stdout.isTTY &&
+      this.pendingWriteStart !== null &&
+      this.coalescedBackpressureFrames < MAX_COALESCED_BACKPRESSURE_FRAMES
+    ) {
+      this.coalescedBackpressureFrames += 1
+      this.isRendering = false
+      // Retry at the same cadence as a scroll drain tick. Don't use
+      // scheduleRender — lodash throttle's leading edge would re-enter here.
+      this.drainTimer = setTimeout(() => this.onRender(), FRAME_INTERVAL_MS >> 2)
+
+      return
+    }
+
+    // Either we wrote, or we hit the ceiling and are forcing a write through.
+    // Reset the coalesce counter so the next backpressure episode starts fresh.
+    this.coalescedBackpressureFrames = 0
 
     // Flush deferred interaction-time update before rendering so we call
     // Date.now() at most once per frame instead of once per keypress.
@@ -919,8 +1037,9 @@ export default class Ink {
     const optimized = optimize(diff)
     const optimizeMs = performance.now() - tOptimize
     const hasDiff = optimized.length > 0
+    const needsAltScreenErase = this.altScreenActive && this.needsEraseBeforePaint
 
-    if (this.altScreenActive && hasDiff) {
+    if (this.altScreenActive && (hasDiff || needsAltScreenErase)) {
       // Prepend CSI H to anchor the physical cursor to (0,0) so
       // log-update's relative moves compute from a known spot (self-healing
       // against out-of-band cursor drift, see the ALT_SCREEN_ANCHOR_CURSOR
@@ -940,14 +1059,36 @@ export default class Ink {
       // resize, so it gets CSI 3J in this one recovery path. When BSU/ESU is
       // supported, the clear+paint lands atomically; otherwise the final state
       // is still healed even if the repaint is visible.
-      if (this.needsEraseBeforePaint) {
+      if (needsAltScreenErase) {
         this.needsEraseBeforePaint = false
-        optimized.unshift(needsAltScreenResizeScrollbackClear() ? DEEP_ERASE_THEN_HOME_PATCH : ERASE_THEN_HOME_PATCH)
+        // CSI 3J only when resize healing asked for it — see
+        // needsDeepEraseBeforePaint. A focus-regain erase must not take the
+        // user's scrollback with it.
+        const deep = this.needsDeepEraseBeforePaint && needsAltScreenResizeScrollbackClear()
+        this.needsDeepEraseBeforePaint = false
+        optimized.unshift(deep ? DEEP_ERASE_THEN_HOME_PATCH : ERASE_THEN_HOME_PATCH)
       } else {
         optimized.unshift(CURSOR_HOME_PATCH)
       }
 
       optimized.push(this.altScreenParkPatch)
+    } else if (this.needsEraseBeforePaint) {
+      // Main screen (INLINE_MODE / Termux). Same atomicity contract as the
+      // alt-screen branch above: fold the clear into this frame's patch list
+      // so clear+paint land in one write instead of a bare
+      // stdout.write(ERASE_SCREEN) followed by the frame. No cursor park —
+      // main-screen cursor position is meaningful (it's the prompt row) and
+      // log-update already restores it. No CSI 3J: scrollback is the user's
+      // history here, not a resize artifact.
+      //
+      // Always consume the flag, but only emit the clear when this frame
+      // actually repaints: a queued erase riding a later incremental frame
+      // (spinner tick) would wipe content that frame doesn't redraw.
+      this.needsEraseBeforePaint = false
+
+      if (hasDiff) {
+        optimized.unshift(ERASE_THEN_HOME_PATCH)
+      }
     }
 
     // Native cursor positioning: park the terminal cursor at the declared
@@ -1062,7 +1203,7 @@ export default class Ink {
     this.lastDrainMs = 0
 
     // Only track drain on TTY. Piped/non-TTY stdout bypasses flow control.
-    const trackDrain = this.options.stdout.isTTY && hasDiff
+    const trackDrain = this.options.stdout.isTTY && optimized.length > 0
     const drainStart = trackDrain ? tWrite : 0
 
     if (trackDrain) {
@@ -1072,7 +1213,13 @@ export default class Ink {
     const { bytes: writeBytes, backpressure } = writeDiffToTerminal(
       this.terminal,
       optimized,
-      this.altScreenActive && !SYNC_OUTPUT_SUPPORTED,
+      // Never emit BSU/ESU (DEC 2026) on terminals that don't support it —
+      // main screen included. Multiplexers like Zellij re-parse and re-chunk
+      // the stream with their own timing, so the markers buy no atomicity and
+      // stale frames get pushed into main-screen scrollback as repeated
+      // chrome (#66490). Supported terminals keep today's behavior on both
+      // screens (skip=false → BSU/ESU wrapped).
+      !SYNC_OUTPUT_SUPPORTED,
       trackDrain
         ? () => {
             // Callback fires once Node has flushed the chunk to the OS.
@@ -1231,13 +1378,13 @@ export default class Ink {
    * the first alt-screen frame (and first main-screen frame on exit) is
    * a full redraw with no stale diff state.
    */
-  setAltScreenActive(active: boolean, mouseTracking = false): void {
+  setAltScreenActive(active: boolean, mouseTracking: MouseTrackingMode = 'off'): void {
     if (this.altScreenActive === active) {
       return
     }
 
     this.altScreenActive = active
-    this.altScreenMouseTracking = active && mouseTracking
+    this.altScreenMouseTracking = active ? mouseTracking : 'off'
 
     // Hover state is alt-screen-scoped: dispatchHover is gated on
     // altScreenActive, so once we leave the alt screen there's no path to
@@ -1251,29 +1398,45 @@ export default class Ink {
 
     if (active) {
       this.resetFramesForAltScreen()
+      this.scheduleRender()
     } else {
       this.repaint()
     }
   }
 
   /**
-   * Toggle mouse tracking at runtime while the alt screen is active.
-   * Writes the appropriate DEC reset/set sequences so the terminal
-   * (and ConPTY on Windows WSL2) reflects the change immediately.
+   * Switch mouse tracking preset at runtime while the alt screen is
+   * active. Always issues DISABLE first so switching between subsets (e.g.
+   * 'all' → 'wheel') clears mode 1003 instead of leaving it asserted —
+   * DEC private modes have no "set this exact bitmask" form, only
+   * individual set/reset, and tmux's mouse-mode bookkeeping does honor the
+   * reset so the prompt-row "No image in clipboard" spam stops.
    */
-  setAltScreenMouseTracking(enabled: boolean): void {
-    if (this.altScreenMouseTracking === enabled) {
+  setAltScreenMouseTracking(mode: MouseTrackingMode): void {
+    if (this.altScreenMouseTracking === mode) {
       return
     }
 
-    this.altScreenMouseTracking = enabled
+    this.altScreenMouseTracking = mode
 
     if (this.altScreenActive) {
-      this.options.stdout.write(enabled ? ENABLE_MOUSE_TRACKING : DISABLE_MOUSE_TRACKING)
+      this.options.stdout.write(DISABLE_MOUSE_TRACKING + enableMouseTrackingFor(mode))
     }
   }
   get isAltScreenActive(): boolean {
     return this.altScreenActive
+  }
+
+  /**
+   * True while the terminal is expected to have DEC mouse tracking armed:
+   * alt screen active, not paused for an editor handoff, and the current
+   * preset isn't 'off'. Gates App's mouse-mode watchdog (DECRQM probe) so
+   * it never probes when tracking is intentionally disabled (/mouse off),
+   * during pause (probe bytes would leak into the external editor's
+   * session), or after unmount.
+   */
+  get expectsMouseTracking(): boolean {
+    return this.altScreenActive && !this.isPaused && !this.isUnmounted && this.altScreenMouseTracking !== 'off'
   }
 
   /**
@@ -1314,7 +1477,9 @@ export default class Ink {
     // Pop-before-push keeps Kitty stack depth at 1 instead of accumulating
     // on each call.
     if (supportsExtendedKeys()) {
-      this.options.stdout.write(DISABLE_KITTY_KEYBOARD + ENABLE_KITTY_KEYBOARD + ENABLE_MODIFY_OTHER_KEYS)
+      this.options.stdout.write(
+        DISABLE_KITTY_KEYBOARD + (skipKittyKeyboardProtocol() ? '' : ENABLE_KITTY_KEYBOARD) + ENABLE_MODIFY_OTHER_KEYS
+      )
     }
 
     if (!this.altScreenActive) {
@@ -1322,9 +1487,10 @@ export default class Ink {
     }
 
     // Mouse tracking — idempotent, safe to re-assert on every stdin gap.
-    if (this.altScreenMouseTracking) {
-      this.options.stdout.write(ENABLE_MOUSE_TRACKING)
-    }
+    // DISABLE first so we land in the exact preset state even if an
+    // external app or tmux left DEC 1003 hover asserted out from under us
+    // since the last assertion.
+    this.options.stdout.write(DISABLE_MOUSE_TRACKING + enableMouseTrackingFor(this.altScreenMouseTracking))
 
     // Alt-screen re-entry — destructive (ERASE_SCREEN). Only for callers that
     // have a strong signal the terminal actually dropped mode 1049.
@@ -1380,10 +1546,28 @@ export default class Ink {
    * stays true. ENTER_ALT_SCREEN is a terminal-side no-op if already in alt.
    */
   private reenterAltScreen(): void {
+    // DISABLE_MOUSE_TRACKING before enableMouseTrackingFor — same as
+    // setAltScreenMouseTracking / AlternateScreen mount / handleResize.
+    // DEC private modes have no atomic "set this bitmask" sequence, only
+    // per-mode set/reset, so for 'wheel'/'buttons' presets we must reset
+    // first to drop any lingering DEC 1003 hover from before re-entry.
     this.options.stdout.write(
-      ENTER_ALT_SCREEN + ERASE_SCREEN + CURSOR_HOME + (this.altScreenMouseTracking ? ENABLE_MOUSE_TRACKING : '')
+      ENTER_ALT_SCREEN +
+        ERASE_SCREEN +
+        CURSOR_HOME +
+        DISABLE_MOUSE_TRACKING +
+        enableMouseTrackingFor(this.altScreenMouseTracking)
     )
     this.resetFramesForAltScreen()
+    // ERASE_SCREEN above leaves the physical alt screen blank, and
+    // resetFramesForAltScreen() seeds prev/back as blank rows×cols, so
+    // nothing on the front frame survives the re-entry. Callers
+    // (handleResume on SIGCONT, the resize self-heal, the stdin-gap
+    // re-assertion) all return early after invoking us, so without an
+    // explicit render schedule the alt screen sits blank until some
+    // unrelated state change fires the next commit. queueing one
+    // microtask matches scheduleRender's normal cadence.
+    this.scheduleRender()
   }
 
   /**
@@ -1442,7 +1626,7 @@ export default class Ink {
       return ''
     }
 
-    const text = getSelectedText(this.selection, this.frontFrame.screen)
+    const text = this.getTextSelectionText()
 
     if (text) {
       try {
@@ -1455,20 +1639,17 @@ export default class Ink {
         if (success) {
           return text
         }
-
-        if (process.env.HERMES_TUI_DEBUG_CLIPBOARD) {
-          console.error(
-            '[clipboard] no path reached the clipboard (headless + no tmux?) — set HERMES_TUI_FORCE_OSC52=1 to force the escape sequence'
-          )
-        }
-      } catch (err) {
-        if (process.env.HERMES_TUI_DEBUG_CLIPBOARD) {
-          console.error('[clipboard] error:', err)
-        }
+      } catch {
+        // Clipboard failed across every path — caller sees the empty
+        // return below and surfaces a hint via the slash command.
       }
     }
 
     return ''
+  }
+
+  getTextSelectionText(): string {
+    return hasSelection(this.selection) ? getSelectedText(this.selection, this.frontFrame.screen) : ''
   }
 
   /**
@@ -2202,6 +2383,85 @@ export default class Ink {
 
     this.cursorDeclaration = decl
   }
+  // Caller writes raw bytes to stdout that move the physical terminal
+  // cursor (e.g. TextInput's fast-echo bypass). Without this notification,
+  // Ink's `displayCursor` cache and log-update's prevFrame.cursor stay
+  // unchanged, so the next frame's relative cursor moves compute from a
+  // stale position and the hardware cursor parks `dx` cells offset from
+  // the actual caret. Visible symptom: extra whitespace between the just-
+  // typed character and the cursor block, more pronounced on long
+  // sessions where unrelated components re-render between fast-echo and
+  // the deferred composer re-render.
+  //
+  // If displayCursor was already tracked, just bump it. Otherwise seed it
+  // to (prevFrame.cursor + delta) so the next frame's preamble emits a
+  // (-dx, -dy) relative move that brings the cursor back to log-update's
+  // expected start position before the diff body runs.
+  //
+  // Public so tests can drive it directly without mounting App.
+  //
+  // Bumps BOTH `displayCursor` (used by log-update's relative-move
+  // preamble) AND, if non-null, `cursorDeclaration.relativeX/Y` (the
+  // target the cursor parks at after every frame). Advancing only one
+  // of the two would leave the other stale: e.g. if the deferred React
+  // `setCur` hasn't flushed yet, the next unrelated re-render would
+  // re-compute `target` from the stale declaration and park the
+  // hardware cursor back at the old caret column. We advance both so
+  // the fast-echo is invisible to intervening frames until React
+  // catches up.
+  noteExternalCursorAdvance: CursorAdvanceNotifier = (dx, dy = 0) => {
+    if (dx === 0 && dy === 0) {
+      return
+    }
+
+    // displayCursor / log-update relative-move basis only matters on
+    // main screen — alt-screen frames begin with absolute CSI H every
+    // frame so the next preamble naturally resets to (0,0). cursorDeclaration,
+    // however, IS still consulted on alt-screen — onRender's park branch
+    // emits an absolute CUP using `rect.x + decl.relativeX`, so a stale
+    // declaration in the deferred-setCur window would park the cursor
+    // at the pre-keystroke caret. We therefore skip ONLY the displayCursor
+    // half on alt-screen, not the declaration half.
+    if (!this.altScreenActive) {
+      if (this.displayCursor !== null) {
+        this.displayCursor = {
+          x: this.displayCursor.x + dx,
+          y: this.displayCursor.y + dy
+        }
+      } else {
+        // No prior parked position. Seed from frontFrame.cursor (where
+        // log-update parked the cursor at the end of the last frame) so
+        // the next preamble's relative move correctly cancels the
+        // external advance.
+        const baseX = this.frontFrame.cursor.x
+        const baseY = this.frontFrame.cursor.y
+        this.displayCursor = { x: baseX + dx, y: baseY + dy }
+      }
+    }
+
+    // Also advance the active cursor declaration if any. Without this,
+    // a TextInput that defers its React `cur` state update (16ms timer
+    // in textInput.tsx — perf optimization that batches re-renders
+    // during heavy typing) leaves `cursorDeclaration.relativeX` pointing
+    // at the pre-keystroke caret column. If an unrelated component
+    // re-renders before the deferred `setCur` flushes, the cursor-park
+    // branch at the end of onRender would move the hardware cursor back
+    // to that stale relativeX and visually undo the fast-echo's
+    // advance. Bumping relativeX here keeps the declared target in
+    // lock-step with the physical cursor until React state catches up.
+    // Applies to BOTH main-screen and alt-screen — the alt-screen park
+    // branch uses an absolute CUP to (rect.x + decl.relativeX), so a
+    // stale declaration there would still produce the wrong column.
+    const decl = this.cursorDeclaration
+
+    if (decl !== null) {
+      this.cursorDeclaration = {
+        node: decl.node,
+        relativeX: decl.relativeX + dx,
+        relativeY: decl.relativeY + dy
+      }
+    }
+  }
   render(node: ReactNode): void {
     this.currentNode = node
 
@@ -2210,7 +2470,10 @@ export default class Ink {
         dispatchKeyboardEvent={this.dispatchKeyboardEvent}
         exitOnCtrlC={this.options.exitOnCtrlC}
         getHyperlinkAt={this.getHyperlinkAt}
+        getSelectedText={this.getTextSelectionText}
         onClickAt={this.dispatchClick}
+        onCopySelectionNoClear={this.copySelectionNoClear}
+        onCursorAdvance={this.noteExternalCursorAdvance}
         onCursorDeclaration={this.setCursorDeclaration}
         onExit={this.unmount}
         onHoverAt={this.dispatchHover}
@@ -2222,6 +2485,7 @@ export default class Ink {
         onSelectionChange={this.notifySelectionChange}
         onSelectionDrag={this.handleSelectionDrag}
         onStdinResume={this.reassertTerminalModes}
+        onTerminalFocusChange={this.handleTerminalFocusChange}
         selection={this.selection}
         stderr={this.options.stderr}
         stdin={this.options.stdin}
