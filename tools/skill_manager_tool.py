@@ -622,6 +622,18 @@ def _run_write_gate(build_staging):
     if decision.allow:
         return None
     if decision.blocked:
+        # Proposal-outcome adapter seam (spec 3.2 case 2 / operator scope
+        # amendment): the proper change mechanism refused the update. Preserve
+        # the proposal durably BEFORE returning the refusal -- there is no
+        # mutation and therefore no write-ledger row to anchor it. Inert unless
+        # the queue capability is armed.
+        with suppress(Exception):
+            from tools.skill_review_events import preserve_proposal
+            from tools.skill_provenance import is_unattended_review
+            _payload, _gist = build_staging(wa)
+            preserve_proposal(_payload, session_id=_payload.get("session_id"),
+                gate={"disposition": "gate_refuse_evidence", "reason": str(decision.message or ""),
+                      "actor_unattended": is_unattended_review()})
         return tool_error(decision.message, success=False)
     payload, gist = build_staging(wa)
     record = wa.stage_write(wa.SKILLS, payload, summary=gist, origin=wa.current_origin())
@@ -643,7 +655,7 @@ def _apply_skill_write_gate(action, name, **payload_kwargs):
 
 
 _FLAT_OP_KEYS = ("content", "category", "file_path", "file_content", "old_string", "new_string",
-                 "absorbed_into", "operations")
+                 "absorbed_into", "operations", "evidence")
 
 
 def _skill_manage_from(payload: Dict[str, Any], **extra) -> str:
@@ -730,9 +742,30 @@ def _record_success(action, name, result, *, file_path, absorbed_into, task_id,
         _evidence = ({"absorbed_into": absorbed_into, "archived": bool(result.get("_archived"))}
                      if action == "delete" else {})
         _evidence.update({k: v for k, v in (("session_id", session_id), ("file_path", file_path)) if v})
-        _ledger.record_mutation(
+        # spec 3.5: additive `gate` sub-object so the disposition is a durable
+        # property of the landed write. Absent any gate, an unattended write is
+        # recorded as gate_bypassed; an attended foreground write is unchanged.
+        with suppress(Exception):
+            from tools.skill_provenance import is_unattended_review
+            from tools.skill_review_trigger import gate_evidence_for_write
+            _unattended = is_unattended_review() or _ledger.derive_actor() == "curator"
+            _gate_ev = gate_evidence_for_write(unattended=_unattended, session_id=session_id)
+            if _gate_ev is not None:
+                _evidence["gate"] = _gate_ev
+        _entry_id = _ledger.record_mutation(
             action, name, before=ledger_before if ledger_before is not None else [],
             after_root=_post["path"] if _post else None, evidence=_evidence)
+        # spec 3.3 step 3: the downstream ledger consumer runs AFTER the append,
+        # by the returned entry id -- never inside append_entry, never blocking
+        # the mutation. Inert unless the queue capability is armed.
+        if _entry_id:
+            with suppress(Exception):
+                from tools.skill_review_trigger import on_landed_mutation_by_id
+                on_landed_mutation_by_id(_entry_id)
+        else:
+            from tools.skill_review_events import on_missing_ledger
+            on_missing_ledger(action, name, before=ledger_before,
+                              after_root=_post["path"] if _post else None, session_id=session_id)
     with suppress(Exception):
         from agent.prompt_builder import clear_skills_system_prompt_cache
         clear_skills_system_prompt_cache(clear_snapshot=True)
@@ -763,12 +796,12 @@ def skill_manage(
     action: str, name: str, content: str = None, category: str = None, file_path: str = None,
     file_content: str = None, old_string: str = None, new_string: str = None,
     replace_all: bool = False, absorbed_into: str = None, task_id: str = None,
-    session_id: str = None, operations=None) -> str:
+    session_id: str = None, operations=None, evidence=None) -> str:
     """Dispatch to the action handler -> JSON string. ``operations`` (atomic batch shape,
     see _skill_manage_batch) overrides the flat fields."""
     if operations is not None:
         return _skill_manage_batch(
-            operations, default_name=name or None, task_id=task_id, session_id=session_id)
+            operations, default_name=name or None, task_id=task_id, session_id=session_id, evidence=evidence)
     if (preflight := _background_review_preflight(action, name)) is not None:
         return json.dumps(preflight, ensure_ascii=False)
     # Approval gate: skills are too large to review inline, so they always stage regardless
@@ -776,7 +809,7 @@ def skill_manage(
     args = dict(content=content, category=category, file_path=file_path, file_content=file_content,
                 old_string=old_string, new_string=new_string, replace_all=replace_all,
                 absorbed_into=absorbed_into)
-    if (gate_result := _apply_skill_write_gate(action, name, **args)) is not None:
+    if (gate_result := _apply_skill_write_gate(action, name, session_id=session_id, evidence=evidence, **args)) is not None:
         return gate_result
     if (shape_err := _op_shape_error(action, args)) is not None:
         return tool_error(shape_err, success=False)
@@ -787,7 +820,12 @@ def skill_manage(
     # A mutation is read-modify-write even when its action eventually delegates
     # to a helper: guards, ledger capture, patch matching, validation, rollback,
     # and the atomic replacement all belong to the same ownership window.
-    with _skill_mutation_lock(name):
+    from tools.skill_write_policy import write_scope
+    with _skill_mutation_lock(name), write_scope(
+        {"action": action, "name": name, **args, "evidence": evidence}, session_id=session_id,
+    ) as policy:
+        if not policy["allowed"]:
+            return tool_error(policy.get("reason") or "Skill policy refused", success=False)
         # Ledger pre-capture: telemetry, not a gate — failures must NEVER block the mutation. delete
         # destroys the whole package (consolidation may have re-homed support files first), so
         # complete it from the newest curator backup or a restore is hollow.
@@ -869,6 +907,16 @@ SKILL_MANAGE_SCHEMA = {
     "parameters": {
         "type": "object",
         "properties": {
+            "evidence": {
+                "type": "object",
+                "description": "For an unattended improvement under a required policy, supply lesson, measurable dimension, check, and marks from at least two independent stored sessions. Use session_search to obtain session_id and message_id references; do not invent them. Unsupported or unavailable judgments refuse the write and preserve a review recommendation.",
+                "properties": {
+                    "lesson": {"type": "string"}, "dimension": {"type": "string"}, "check": {"type": "string"},
+                    "marks": {"type": "array", "items": {"type": "object", "properties": {
+                        "session_id": {"type": "string"}, "message_id": {"type": "integer"}},
+                        "required": ["session_id", "message_id"]}},
+                },
+            },
             "operations": {
                 "type": "array",
                 "description": (

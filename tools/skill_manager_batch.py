@@ -185,7 +185,7 @@ _ADVISORY_KEYS = ("lint_warnings", "lint_hint", "org_sharing")
 
 
 def _skill_manage_batch(operations, default_name: str = None, task_id: str = None,
-                        session_id: str = None) -> str:
+                        session_id: str = None, evidence=None) -> str:
     """Apply operations atomically: every touched skill is snapshotted first and any
     failure rolls ALL of them back (batch-created skills are removed). ``delete`` is
     only legal as the SOLE op (its recoverable-archive path doesn't compose with
@@ -205,7 +205,7 @@ def _skill_manage_batch(operations, default_name: str = None, task_id: str = Non
         if not nm:
             return tool_error("operations[0] (delete) needs a 'name'.", success=False)
         return _smt.skill_manage(action="delete", name=nm, task_id=task_id, session_id=session_id,
-                                 absorbed_into=operations[0].get("absorbed_into"))
+                                 absorbed_into=operations[0].get("absorbed_into"), evidence=evidence)
     names, err = _validate_batch_ops(operations, default_name, tool_error)
     if err is not None:
         return err
@@ -214,14 +214,19 @@ def _skill_manage_batch(operations, default_name: str = None, task_id: str = Non
         def _staging(wa):
             acts = ", ".join(op["action"] for op in operations)
             gist = f"batch({len(operations)} ops: {acts}) on {', '.join(sorted(set(names)))}"
-            return {"action": "batch", "operations": operations}, gist
+            return {"action": "batch", "operations": operations, "evidence": evidence, "session_id": session_id}, gist
         staged = _smt._run_write_gate(_staging)
         if staged is not None:
             return staged
     # Every target's lock is held from the snapshot through commit or rollback; the per-op
     # skill_manage() calls re-enter them. Without the outer fence a concurrent writer landing
     # between the snapshot and a rollback would be silently reverted.
-    with _smt._skill_mutation_locks(names):
+    from tools.skill_write_policy import write_scope
+    with _smt._skill_mutation_locks(names), write_scope(
+        {"action": "batch", "operations": operations, "evidence": evidence}, session_id=session_id,
+    ) as policy:
+        if not policy["allowed"]:
+            return tool_error(policy.get("reason") or "Skill policy refused", success=False)
         snap_root = Path(tempfile.mkdtemp(prefix="skill_batch_"))
         snapshots, snap_err = _snapshot_skills(names, snap_root, _smt._find_skill)
         if snap_err is not None:

@@ -850,7 +850,7 @@ def _memory_query_text(original_user_message: Any) -> str:
     return ""
 
 
-def _memory_turn_start_and_prefetch(
+def _notify_memory_turn_start(
     agent: Any, original_user_message: Any, turn_author: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Notify memory providers of the new turn, then prefetch external memory once
@@ -867,6 +867,13 @@ def _memory_turn_start_and_prefetch(
             author_id=_author.get("id") or None, author_name=_author.get("name") or None,
             author_is_bot=bool(_author.get("is_bot")),
         )
+
+
+def _memory_turn_start_and_prefetch(agent, original_user_message, turn_author=None):
+    _notify_memory_turn_start(agent, original_user_message, turn_author)
+    if not agent._memory_manager:
+        return ""
+    _query = _memory_query_text(original_user_message)
     ext_prefetch_cache = ""
     with suppress(Exception):
         if not is_trivial_prompt(_query):
@@ -1129,7 +1136,14 @@ def build_turn_context(
     )
 
     _bind_interrupt_scope(agent, ra)
-    ext_prefetch_cache = _memory_turn_start_and_prefetch(agent, original_user_message, turn_author)
+    from agent.turn_selection import select_turn_context
+    ext_prefetch_cache, selection_context = select_turn_context(
+        agent, messages, original_user_message,
+        lambda: _memory_turn_start_and_prefetch(agent, original_user_message, turn_author),
+        notify_turn=lambda: _notify_memory_turn_start(agent, original_user_message, turn_author),
+    )
+    if selection_context:
+        plugin_user_context = "\n\n".join(p for p in (plugin_user_context, selection_context) if p)
 
     # Title the session now: titling depends only on the user's ask (before any injected
     # context lands on list content), so it runs concurrently with the turn. Daemon thread,
