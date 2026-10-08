@@ -28,3 +28,8 @@ has been ported to a newer upstream commit, and a source push does not install i
 Future changes belong in this fork, with tests and a reviewed update plan;
 workspace patch bundles are deployment history, not canonical editing locations.
 The source behavior checks are run with `scripts/run_tests.sh`.
+
+The fork-only `customizations/hermes-memory` branch adds the deployed
+workflow-builder evidence reminder to both skill-writing background review
+prompts. It depends on `codex/jev-turn-gate`. This reminder does not replace
+the optional deterministic policy hook and does not enable the write gate.
