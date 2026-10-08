@@ -519,6 +519,17 @@ class MemoryManager:
         )
         return "\n\n".join(p for p in parts if p and p.strip())
 
+    def prefetch_structured(self, feed: Dict[str, Any], *, session_id: str = "", deadline: Optional[float] = None, timeout: Optional[float] = None) -> List[Dict[str, Any]]:
+        """Negotiate structured recall per provider; unsupported providers keep legacy text."""
+        from agent.memory_structured import prefetch_batch
+        if not isinstance(feed, dict) or not feed.get("query"):
+            return []
+        if timeout is not None:
+            import math
+            if type(timeout) not in (int, float) or not math.isfinite(timeout) or timeout <= 0:
+                raise ValueError("structured recall timeout must be finite and positive")
+        return [prefetch_batch(self, provider, feed, session_id, deadline=deadline, timeout=timeout) for provider in self._providers]
+
     def _prefetch_provider(self, provider: MemoryProvider, query: str, *, session_id: str = "") -> str:
         """Run one provider's prefetch; external providers are bounded by a timeout. A stuck external
         call keeps running on its daemon thread and the provider is skipped on later turns until it returns."""

@@ -663,6 +663,18 @@ def _run_write_gate(build_staging):
     if decision.allow:
         return None
     if decision.blocked:
+        # Proposal-outcome adapter seam (spec 3.2 case 2 / operator scope
+        # amendment): the proper change mechanism refused the update. Preserve
+        # the proposal durably BEFORE returning the refusal -- there is no
+        # mutation and therefore no write-ledger row to anchor it. Inert unless
+        # the queue capability is armed.
+        with suppress(Exception):
+            from tools.skill_review_events import preserve_proposal
+            from tools.skill_provenance import is_unattended_review
+            _payload, _gist = build_staging(wa)
+            preserve_proposal(_payload, session_id=_payload.get("session_id"),
+                gate={"disposition": "gate_refuse_evidence", "reason": str(decision.message or ""),
+                      "actor_unattended": is_unattended_review()})
         return tool_error(decision.message, success=False)
     payload, gist = build_staging(wa)
     record = wa.stage_write(wa.SKILLS, payload, summary=gist, origin=wa.current_origin())
@@ -684,7 +696,7 @@ def _apply_skill_write_gate(action, name, **payload_kwargs):
 
 
 _FLAT_OP_KEYS = ("content", "category", "file_path", "file_content", "old_string", "new_string",
-                 "absorbed_into", "operations")
+                 "absorbed_into", "operations", "evidence")
 
 
 def _skill_manage_from(payload: dict[str, Any], **extra) -> str:
@@ -736,9 +748,30 @@ def _record_success(action, name, result, *, file_path, absorbed_into, task_id,
         _evidence = ({"absorbed_into": absorbed_into, "archived": bool(result.get("_archived"))}
                      if action == "delete" else {})
         _evidence.update({k: v for k, v in (("session_id", session_id), ("file_path", file_path)) if v})
-        _ledger.record_mutation(
+        # spec 3.5: additive `gate` sub-object so the disposition is a durable
+        # property of the landed write. Absent any gate, an unattended write is
+        # recorded as gate_bypassed; an attended foreground write is unchanged.
+        with suppress(Exception):
+            from tools.skill_provenance import is_unattended_review
+            from tools.skill_review_trigger import gate_evidence_for_write
+            _unattended = is_unattended_review() or _ledger.derive_actor() == "curator"
+            _gate_ev = gate_evidence_for_write(unattended=_unattended, session_id=session_id)
+            if _gate_ev is not None:
+                _evidence["gate"] = _gate_ev
+        _entry_id = _ledger.record_mutation(
             action, name, before=ledger_before if ledger_before is not None else [],
             after_root=_post["path"] if _post else None, evidence=_evidence)
+        # spec 3.3 step 3: the downstream ledger consumer runs AFTER the append,
+        # by the returned entry id -- never inside append_entry, never blocking
+        # the mutation. Inert unless the queue capability is armed.
+        if _entry_id:
+            with suppress(Exception):
+                from tools.skill_review_trigger import on_landed_mutation_by_id
+                on_landed_mutation_by_id(_entry_id)
+        else:
+            from tools.skill_review_events import on_missing_ledger
+            on_missing_ledger(action, name, before=ledger_before,
+                              after_root=_post["path"] if _post else None, session_id=session_id)
     with suppress(Exception):
         from agent.prompt_builder import clear_skills_system_prompt_cache
         clear_skills_system_prompt_cache(clear_snapshot=True)
@@ -766,160 +799,4 @@ def skill_manage(
     action: str, name: str, content: str | None = None, category: str | None = None, file_path: str | None = None,
     file_content: str | None = None, old_string: str | None = None, new_string: str | None = None,
     replace_all: bool = False, absorbed_into: str | None = None, task_id: str | None = None,
-    session_id: str | None = None, operations=None) -> str:
-    """Dispatch to the action handler -> JSON string. ``operations`` (atomic batch shape,
-    see _skill_manage_batch) overrides the flat fields."""
-    if operations is not None:
-        return _skill_manage_batch(
-            operations, default_name=name or None, task_id=task_id, session_id=session_id)
-    if (preflight := _background_review_preflight(action, name)) is not None:
-        return json.dumps(preflight, ensure_ascii=False)
-    # Approval gate: skills are too large to review inline, so they always stage regardless
-    # of origin; bypassed when replaying an approved staged write.
-    args = dict(content=content, category=category, file_path=file_path, file_content=file_content,
-                old_string=old_string, new_string=new_string, replace_all=replace_all,
-                absorbed_into=absorbed_into)
-    if (gate_result := _apply_skill_write_gate(action, name, **args)) is not None:
-        return gate_result
-    if (shape_err := _op_shape_error(action, args)) is not None:
-        return tool_error(shape_err, success=False)
-    # Validate before the lock is keyed on the name, so a rejected name never touches .locks/
-    # (create takes a bare name; the other actions also accept ``category/name``).
-    if (name_err := _validate_name(name if action == "create" or not name else Path(name).name)) is not None:
-        return json.dumps(_err(name_err), ensure_ascii=False)
-    # A mutation is read-modify-write even when its action eventually delegates
-    # to a helper: guards, ledger capture, patch matching, validation, rollback,
-    # and the atomic replacement all belong to the same ownership window.
-    with _skill_mutation_lock(name):
-        # Ledger pre-capture: telemetry, not a gate — failures must NEVER block the mutation. delete
-        # destroys the whole package (consolidation may have re-homed support files first), so
-        # complete it from the newest curator backup or a restore is hollow.
-        # Audit ledger (tracker #79686 P3): capture the pre-mutation state of the skill directory so every
-        # mutation — any actor — lands in the append-only JSONL ledger with before/after blobs.
-        _ledger_before = None
-        with suppress(Exception):
-            from tools import skill_ledger as _ledger
-            _pre = _find_skill(name)
-            _ledger_before = _ledger.capture_before(
-                _pre["path"] if _pre else None, complete_package=(action == "delete"), skill=name)
-        handler = _ACTION_HANDLERS.get(action, lambda a: _err(
-            f"Unknown action '{action}'. Use: create, edit, patch, delete, write_file, remove_file"))
-        result = handler({"name": name, **args})
-        if isinstance(result, str):
-            return result  # tool_error JSON for argument-shape problems (patch)
-        if result.get("success"):
-            _record_success(
-                action, name, result, file_path=file_path, absorbed_into=absorbed_into,
-                task_id=task_id, session_id=session_id, ledger_before=_ledger_before)
-    return json.dumps(result, ensure_ascii=False)
-
-
-# --- OpenAI Function-Calling Schema -------------------------------------------
-
-def _skill_manage_description() -> str:
-    return (
-        "Create, update, or delete skills — your procedural memory for "
-        "recurring task types. The call is an operations array (a single "
-        "edit is a list of one); it applies atomically — any failure rolls "
-        "every touched skill back. Ops: create (full SKILL.md; lands in "
-        "the profile's skills directory or configured skills.create_dir; must precede that skill's other "
-        "ops), patch (targeted old_string/new_string fix — preferred; "
-        "content alone REPLACES the whole file, read it via skill_view() "
-        "first), write_file/remove_file (supporting files), delete (sole "
-        "op only). Existing skills are modified wherever they live. Keep "
-        "the description's first 57 chars a self-contained trigger: 'Use "
-        "when <trigger>. <one-line behavior>.' Write lessons, not logs: "
-        "imperative rule + why, no PR numbers/dates/incident narration, one "
-        "rule per lesson, references/ named by topic (extend before adding). "
-        "skill_view() shows format conventions."
-    )
-
-
-_NAME = {"type": "string"}
-_OLD_STRING = {"type": "string",
-               "description": "Text to find (same matching semantics as the patch tool)."}
-_NEW_STRING = {"type": "string", "description": "Replacement; empty string deletes the match."}
-_FILE_PATH = {
-    "type": "string",
-    "description": (
-        "Path RELATIVE to the skill's own directory, e.g. 'references/api.md' — no leading "
-        "slash, never absolute; first segment references/, templates/, scripts/, or assets/."
-    ),
-}  # stated once (write_file); patch/remove_file point at it
-
-
-def _op_schema(action: str, props: dict, required: tuple) -> dict:
-    """One self-contained per-action op shape. ``additionalProperties: false`` is what lets a
-    grammar-constrained backend refuse another action's text slot outright."""
-    return {"type": "object", "additionalProperties": False,
-            "properties": {"name": _NAME, "action": {"type": "string", "enum": [action]}, **props},
-            "required": ["name", "action", *required]}
-
-
-SKILL_MANAGE_SCHEMA = {
-    "name": "skill_manage",
-    # ONE advertised call shape (memory-tool pattern): the call IS an operations
-    # array. The legacy flat shape (top-level action/name/content/...) is still
-    # ACCEPTED for old transcripts and staged-write replay, but not advertised.
-    "description": _skill_manage_description(),
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "operations": {
-                "type": "array",
-                "description": (
-                    "Ordered ops; each names its target skill (lowercase, hyphens/underscores, "
-                    "max 64 chars). Each action is its own shape; another action's text slot is invalid."
-                ),
-                # Per-action branches, not one flat union: with one object holding content /
-                # new_string / file_content side by side, a 27B model that just used write_file
-                # kept emitting file_content on create and the whole batch rolled back (#112677).
-                "items": {"anyOf": [
-                    _op_schema("create", {
-                        "content": {"type": "string",
-                                    "description": "Full SKILL.md text (YAML frontmatter + markdown body)."},
-                        "category": {"type": "string",
-                                     "description": "Optional category subdir (e.g. 'devops')."},
-                    }, ("content",)),
-                    _op_schema("patch", {
-                        "old_string": _OLD_STRING, "new_string": _NEW_STRING,
-                        "replace_all": {"type": "boolean",
-                                        "description": "Replace all occurrences (default false)."},
-                        "file_path": {"type": "string",
-                                      "description": "Optional supporting file (write_file's shape); default SKILL.md."},
-                    }, ("old_string", "new_string")),
-                    _op_schema("patch", {
-                        "content": {"type": "string",
-                                    "description": "Full SKILL.md rewrite (REPLACES the whole file; last resort)."},
-                    }, ("content",)),
-                    _op_schema("write_file", {
-                        "file_path": _FILE_PATH,
-                        "file_content": {"type": "string", "description": "Full text of the supporting file."},
-                    }, ("file_path", "file_content")),
-                    _op_schema("remove_file", {
-                        "file_path": {"type": "string", "description": "Supporting file (write_file's shape)."},
-                    }, ("file_path",)),
-                    # `absorbed_into` stays in the delete shape: with additionalProperties:false a
-                    # grammar-constrained backend would otherwise strip it and the curator's
-                    # consolidation delete guard would fail-close every consolidation.
-                    _op_schema("delete", {
-                        "absorbed_into": {"type": "string",
-                                          "description": "Curator consolidation only: umbrella skill "
-                                                         "that absorbed this one (must exist)."},
-                    }, ()),
-                ]},
-            },
-            # Also accepted, never advertised: the legacy flat single-op fields.
-        },
-        "required": ["operations"],
-    },
-}
-
-
-# --- Registry ---
-from tools.registry import registry, tool_error
-
-registry.register(
-    name="skill_manage", toolset="skills", schema=SKILL_MANAGE_SCHEMA, emoji="📝",
-    handler=lambda args, **kw: _skill_manage_from(
-        args, task_id=kw.get("task_id"), session_id=kw.get("session_id")))
+    session_id: str | None = None, operations=None, evidence=None) -> str:

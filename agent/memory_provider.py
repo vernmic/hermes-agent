@@ -87,6 +87,15 @@ class MemoryProvider(ABC):
     # Providers that durably checkpoint every successful on_pre_compress() set this to
     # PRE_COMPRESS_CHECKPOINT_API_VERSION; 1 = best-effort legacy.
     pre_compress_checkpoint_api_version = 1
+    structured_recall_api_version = 0
+
+    def prefetch_candidates(self, feed: Dict[str, Any], *, session_id: str = "") -> Dict[str, Any]:
+        """Opt-in struct_feed_v1: current candidates with bank-qualified ids and provenance.
+
+        Version 1 providers return text, tags, dates, scores and per-call errors; never a
+        previous-turn cache. Legacy providers retain their string prefetch path.
+        """
+        return {"candidates": [], "error": "unsupported"}
 
     @property
     @abstractmethod
