@@ -26,13 +26,18 @@ output go to `~/.hermes/logs/dashboard-watchdog.log` and
 on its next start if larger than 5 MB.
 
 The supervisor uses flock to exclude concurrent checks. A healthy HTTP status
-response is sufficient even if the gateway reports degraded health. Missing
+response matching this Hermes home/version is sufficient even if the gateway
+reports degraded health. Missing
 dashboard processes restart on the next poll (15 seconds); unhealthy owned
 sessions get a 300-second grace period, including frontend builds. Attempts
 are limited to one every 30 seconds. Only sessions marked as owned by this
 configuration may be stopped; foreign listeners and unowned unhealthy tmux
 sessions are preserved and logged for investigation. Healthy sessions survive
-watchdog restarts. The default command omits the interactive TUI.
+watchdog restarts. The default command omits the interactive TUI and uses
+`--skip-build` so crash recovery does not rebuild the frontend. After updating
+Hermes frontend sources, build them with `cd ~/.hermes/hermes-agent/web && npm
+run build` before resuming supervision. A custom command may omit that flag
+if startup should build the UI; the 300-second grace accommodates that.
 
 For maintenance, pause recovery before stopping/upgrading the dashboard:
 
