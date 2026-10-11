@@ -183,6 +183,7 @@ def main():
             str(Path.home() / ".local/bin/hermes"),
             "dashboard",
             "--no-open",
+            "--skip-build",
             "--host",
             "127.0.0.1",
             "--port",
