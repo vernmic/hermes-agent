@@ -36,7 +36,7 @@ if ($Command) {
     if ($Command.Contains('"') -or $Command.Contains("`n") -or $Command.Contains("`r")) {
         throw 'Command must be a single line without double quotes.'
     }
-    $arguments += " --command `"$Command`""
+    $arguments += " -- $Command"
 }
 $action = New-ScheduledTaskAction -Execute $wsl -Argument $arguments
 $logon = New-ScheduledTaskTrigger -AtLogOn -User ([System.Security.Principal.WindowsIdentity]::GetCurrent().Name)
