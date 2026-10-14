@@ -899,12 +899,10 @@ def _memory_query_text(original_user_message: Any) -> str:
     return ""
 
 
-def _memory_turn_start_and_prefetch(
+def _notify_memory_turn_start(
     agent: Any, original_user_message: Any, turn_author: Optional[dict[str, Any]] = None,
-) -> str:
-    """Notify memory providers of the new turn, then prefetch external memory once
-    before the tool loop (skipped on trivial prompts with no semantic signal).
-    Returns the prefetch text (``""`` when nothing was injected)."""
+) -> None:
+    """Notify memory providers once before either structured or legacy recall."""
     if not agent._memory_manager:
         return ""
     _query = _memory_query_text(original_user_message)
