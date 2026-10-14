@@ -10,6 +10,9 @@ import re
 from itertools import chain
 from pathlib import Path
 import shutil
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from hermes_cli.config import atomic_config_write
 from utils import load_yaml_file_readonly
