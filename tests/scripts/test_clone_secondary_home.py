@@ -4,7 +4,7 @@ from pathlib import Path
 import pytest
 
 from scripts.clone_secondary_home import clone_home
-from hermes_cli.profiles import _get_profiles_root, resolve_profile
+from hermes_cli.profiles import _get_profiles_root, get_profile_dir
 from utils import load_yaml_file_readonly
 
 
@@ -53,4 +53,4 @@ def test_secondary_profile_root_a_b_a(tmp_path, monkeypatch):
     for root in [roots[0], roots[1], roots[0]]:
         monkeypatch.setenv('HERMES_HOME', str(root))
         assert _get_profiles_root() == root / 'profiles'
-        assert resolve_profile('coder') == root / 'profiles/coder'
+        assert get_profile_dir('coder') == root / 'profiles/coder'
