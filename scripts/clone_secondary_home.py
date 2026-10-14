@@ -6,6 +6,8 @@ schedules are deliberately fresh; credentials are copied locally, never emitted.
 import argparse
 import datetime
 import json
+import re
+from itertools import chain
 from pathlib import Path
 import shutil
 
@@ -21,8 +23,8 @@ MESSAGING_PREFIXES = ('TELEGRAM_', 'EMAIL_', 'DISCORD_', 'SLACK_', 'WHATSAPP_',
                       'MATRIX_', 'SIGNAL_', 'IRC_', 'FEISHU_', 'DINGTALK_')
 
 
-def clone_home(source, target, api_url, ui_url):
-    if (target / 'config.yaml').exists():
+def clone_home(source, target, api_url, ui_url, *, resume=False):
+    if (target / 'config.yaml').exists() and not resume:
         raise RuntimeError(f'Refusing to overwrite configured home: {target}')
     target.mkdir(parents=True, exist_ok=True)
     for name in FILES:
@@ -42,7 +44,9 @@ def clone_home(source, target, api_url, ui_url):
                     ('hindsight-hindsight-1', 'hindsight2-hindsight-1'),
                     ('hindsight-postgres-1', 'hindsight2-postgres-1'))
     changed = []
-    for p in target.rglob('*'):
+    copied = chain((target / name for name in FILES),
+                   *( (target / name).rglob('*') for name in DIRS ))
+    for p in copied:
         if not p.is_file() or p.suffix not in TEXT_SUFFIXES and p.name != '.env':
             continue
         try:
@@ -50,7 +54,7 @@ def clone_home(source, target, api_url, ui_url):
         except (OSError, UnicodeError):
             continue
         for before, after in replacements:
-            text = text.replace(before, after)
+            text = re.sub(re.escape(before) + r"(?![A-Za-z0-9_.-])", lambda m: after, text)
         if p.name == '.env':
             text = '\n'.join(l for l in text.splitlines()
                              if not l.split('=', 1)[0].startswith(MESSAGING_PREFIXES)) + '\n'
@@ -94,14 +98,15 @@ def main():
     parser.add_argument('--api-url', default='http://host.docker.internal:8889')
     parser.add_argument('--ui-url', default='http://host.docker.internal:9998')
     parser.add_argument('--receipt', type=Path, required=True)
+    parser.add_argument('--resume', action='store_true', help='Resume this helper after a partial copy; overwrites only copied configuration.')
     args = parser.parse_args()
     source, target = args.source.resolve(), args.target.resolve()
     if source == target or source in target.parents or target in source.parents:
         parser.error('Source and target must be separate Hermes homes.')
-    records = [clone_home(source, target, args.api_url, args.ui_url)]
+    records = [clone_home(source, target, args.api_url, args.ui_url, resume=args.resume)]
     for profile in sorted((source / 'profiles').iterdir()):
         if profile.name.startswith('.') or not (profile / 'config.yaml').is_file(): continue
-        records.append(clone_home(profile, target / 'profiles' / profile.name, args.api_url, args.ui_url))
+        records.append(clone_home(profile, target / 'profiles' / profile.name, args.api_url, args.ui_url, resume=args.resume))
     args.receipt.write_text(json.dumps({'profiles': records}, indent=2))
     print(json.dumps({'profiles': len(records), 'skills': sum(r['skills'] for r in records),
                       'paused_jobs': sum(r['paused_jobs'] for r in records)}))

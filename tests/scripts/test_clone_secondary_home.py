@@ -19,6 +19,10 @@ def test_copy_retargets_memory_and_skills_without_production_work(tmp_path):
     (source / 'cron').mkdir()
     (source / 'cron/jobs.json').write_text(json.dumps({'jobs': [{'id': 'j1', 'enabled': True, 'state': 'active'}]}))
     (source / 'state.db').write_bytes(b'not-a-session-copy')
+    (target / 'installs').mkdir(parents=True)
+    metadata = target / 'installs/state.json'
+    metadata.write_text(json.dumps({'home': str(target)}))
+    expected_metadata = metadata.read_bytes()
     original = (source / '.env').read_bytes()
     result = clone_home(source, target, 'http://host.docker.internal:8889', 'http://host.docker.internal:9998')
     cfg = load_yaml_file_readonly(target / 'config.yaml')
@@ -33,6 +37,7 @@ def test_copy_retargets_memory_and_skills_without_production_work(tmp_path):
     assert jobs[0]['enabled'] is False and jobs[0]['state'] == 'paused'
     assert not (target / 'state.db').exists()
     assert (source / '.env').read_bytes() == original
+    assert metadata.read_bytes() == expected_metadata
     assert result['skills'] == 1
     with pytest.raises(RuntimeError, match='Refusing to overwrite'):
         clone_home(source, target, 'different', 'different')
