@@ -313,11 +313,13 @@ class TestStoredPromptReuse:
         leaving ``tool_names`` a hash that resolves to itself. The next turn must pin what it sends,
         or every later surface hop re-derives tools[] for the rest of the session."""
         from hermes_state import SessionDB
+        from agent.system_prompt import identity_files_digest
 
         tools = [{"type": "function", "function": {"name": "read_file", "description": "", "parameters": {}}}]
+        stored = f"BUILT_PROMPT\n\nIdentity-files: {identity_files_digest(tmp_path)}"
         with SessionDB(db_path=tmp_path / "state.db") as db:
             db.create_session("test-session-id", source="tui")
-            db.update_system_prompt("test-session-id", "BUILT_PROMPT")
+            db.update_system_prompt("test-session-id", stored)
             db._conn.execute("UPDATE sessions SET tool_names = ? WHERE id = 'test-session-id'", ("ab" * 32,))
             db._conn.commit()
             agent = _make_agent(session_db=db)
@@ -326,7 +328,7 @@ class TestStoredPromptReuse:
             with patch("agent.conversation_loop._stored_prompt_matches_runtime", return_value=True):
                 _restore_or_build_system_prompt(agent, None, [{"role": "user", "content": "hi"}])
 
-            assert agent._cached_system_prompt == "BUILT_PROMPT"
+            assert agent._cached_system_prompt == stored
             assert json.loads(db.get_session("test-session-id")["tool_names"])["tools"] == tools
 
 
@@ -581,19 +583,21 @@ class TestPerResponseSessionWritePath:
     ):
         """Second turn of the SAME id restores — so nothing was dropped."""
         from hermes_state import SessionDB
+        from agent.system_prompt import identity_files_digest
 
         session_id = "gc_run_room42_default_Worker_9a7e3b1c05d24e6fb83a1c7d9e0f2a4b"
         history = [{"role": "user", "content": "hi"}]
+        prompt = f"GROUP_PROMPT\n\nIdentity-files: {identity_files_digest(tmp_path)}"
         with SessionDB(db_path=tmp_path / "state.db") as db:
             db.create_session(session_id, source="studio")
             db.append_message(session_id=session_id, role="user", content="hi")
 
+            first = _make_agent(session_db=db, prebuilt_prompt=prompt)
+            first.session_id = session_id
             with caplog.at_level(
                 logging.WARNING, logger="agent.conversation_loop"
             ):
-                _restore_or_build_system_prompt(
-                    self._agent(db, session_id), None, history
-                )
+                _restore_or_build_system_prompt(first, None, history)
             assert "is null" in caplog.text
 
             caplog.clear()
@@ -603,7 +607,7 @@ class TestPerResponseSessionWritePath:
             ):
                 _restore_or_build_system_prompt(second, None, history)
 
-            assert second._cached_system_prompt == "GROUP_PROMPT"
+            assert second._cached_system_prompt == prompt
             second._build_system_prompt.assert_not_called()
             assert "is null" not in caplog.text
 

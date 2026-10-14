@@ -252,6 +252,62 @@ def _agent_home(agent: Any) -> Optional[Path]:
         return None
 
 
+_IDENTITY_FILES = ("SOUL.md", "memories/MEMORY.md", "memories/USER.md")
+_IDENTITY_STAMP_PREFIX = "Identity-files: "
+
+
+def identity_files_digest(home: Path) -> str:
+    """Short hash of the profile identity files. Missing files hash as empty."""
+    import hashlib
+    digest = hashlib.sha256()
+    for rel in _IDENTITY_FILES:
+        digest.update(rel.encode())
+        digest.update(b"\0")
+        path = home / rel
+        try:
+            data = path.read_bytes() if path.is_file() else b""
+        except OSError:
+            data = b""
+        digest.update(data)
+        digest.update(b"\0")
+    return digest.hexdigest()[:16]
+
+
+def identity_files_stamp(agent: Any) -> str:
+    """``Identity-files: <digest>`` for a real profile home, else \"\".
+
+    An unresolved or fake home returns \"\" so restore tests that never bind a
+    profile keep the cached prompt. A real home always stamps, including when
+    the files are absent, so a later write is visible.
+    """
+    home = _agent_home(agent)
+    if home is None:
+        return ""
+    try:
+        home = Path(home)
+        if not home.is_dir():
+            return ""
+    except (OSError, TypeError):
+        return ""
+    return f"{_IDENTITY_STAMP_PREFIX}{identity_files_digest(home)}"
+
+
+def identity_files_prompt_stale(agent: Any, stored_prompt: str) -> bool:
+    """True when the stored prompt's identity stamp does not match disk.
+
+    Fail closed (reuse the cached prompt) when the home cannot be resolved.
+    An unstamped prompt for a real home is stale: one rebuild adopts the stamp.
+    """
+    try:
+        stamp = identity_files_stamp(agent)
+        if not stamp:
+            return False
+        return stamp not in (stored_prompt or "")
+    except Exception:
+        logger.debug("identity-file stamp check failed", exc_info=True)
+        return False
+
+
 def _agent_skills_dir(agent: Any) -> Optional[Path]:
     """The agent's own ``<home>/skills`` dir, or None to use ambient home."""
     home = _agent_home(agent)
@@ -799,14 +855,20 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
 
 def build_system_prompt(agent: Any, system_message: Optional[str] = None) -> str:
     """Assemble the full prompt; cached on ``agent._cached_system_prompt`` and
-    only rebuilt after compression.  Tiers are ordered stable -> context ->
-    volatile so implicit longest-prefix caches keep the unchanged scaffold."""
+    only rebuilt after compression or an identity-file change.  Tiers are ordered
+    stable -> context -> volatile so implicit longest-prefix caches keep the
+    unchanged scaffold.
+    """
     parts = build_system_prompt_parts(agent, system_message=system_message)
     agent._cached_system_prompt_static = parts["stable"]
     # Surface context-file truncation warnings in chat, not only in logs.
     for warning in drain_truncation_warnings():
         agent._emit_diagnostic_status(warning)
-    return "\n\n".join(p for p in (parts["stable"], parts["context"], parts["volatile"]) if p)
+    text = "\n\n".join(p for p in (parts["stable"], parts["context"], parts["volatile"]) if p)
+    stamp = identity_files_stamp(agent)
+    # Trailing stamp, not a tier: a MEMORY.md / USER.md / SOUL.md edit must be
+    # visible to the restore path, which otherwise reuses the persisted prompt.
+    return f"{text}\n\n{stamp}" if stamp else text
 
 
 def invalidate_system_prompt(agent: Any) -> None:

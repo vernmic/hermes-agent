@@ -792,6 +792,27 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
                 persist_tools=True,
             )
             return
+        from agent.system_prompt import identity_files_prompt_stale
+        if identity_files_prompt_stale(agent, stored_prompt):
+            logger.info(
+                "Identity files changed for session %s; rebuilding system prompt "
+                "(one-time prefix-cache break).",
+                agent.session_id,
+            )
+            store = getattr(agent, "_memory_store", None)
+            if store is not None:
+                try:
+                    store.load_from_disk()
+                except Exception:
+                    logger.debug("identity reload: memory load failed", exc_info=True)
+            agent._cached_system_prompt = agent._build_system_prompt(system_message)
+            stage_surface_switch_note(agent, agent._cached_system_prompt, conversation_history)
+            _persist_system_prompt(
+                agent,
+                "Session DB update_system_prompt failed after identity-file refresh "
+                "(session=%s): %s. The refresh will re-fire next turn.",
+            )
+            return
         # Continuing session — reuse the exact system prompt from the
         # previous turn so the Anthropic cache prefix matches.
         agent._cached_system_prompt = stored_prompt

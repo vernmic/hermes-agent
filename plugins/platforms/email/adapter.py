@@ -446,6 +446,118 @@ def _attach_file(msg: MIMEMultipart, path: Path, filename: str) -> None:
         msg.attach(part)
 
 
+_EMAIL_HTML_STYLE = """\
+body{font-family:-apple-system,'Segoe UI',Roboto,Arial,sans-serif;font-size:15px;line-height:1.55;\
+color:#1f2430;background:#ffffff;margin:0;padding:24px;}\
+.container{max-width:680px;margin:0 auto;}\
+.header{border-bottom:3px solid #4f6df5;padding-bottom:12px;margin-bottom:20px;}\
+.header .brand{font-size:13px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:#4f6df5;}\
+.header .date{font-size:12px;color:#8a91a3;margin-top:2px;}\
+h1{font-size:20px;margin:0 0 16px;}h2{font-size:16px;margin:24px 0 8px;color:#2a3142;}\
+p{margin:0 0 12px;}\
+.alert{background:#fdecea;border-left:4px solid #d93025;color:#8f1a12;padding:10px 14px;border-radius:4px;margin:0 0 16px;font-weight:600;}\
+.rec{background:#f3f6ff;border-left:4px solid #4f6df5;padding:10px 14px;border-radius:4px;margin:0 0 12px;}\
+.rec .label{font-size:11px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:#4f6df5;}\
+.status{color:#545b6e;font-size:14px;}\
+pre,code{font-family:ui-monospace,Consolas,monospace;font-size:13px;background:#f4f5f8;border-radius:4px;}\
+pre{padding:10px 12px;overflow-x:auto;}code{padding:1px 4px;}\
+.footer{margin-top:28px;padding-top:12px;border-top:1px solid #e6e8ee;font-size:12px;color:#8a91a3;}\
+@media(prefers-color-scheme:dark){body{background:#161a23;color:#dfe3ec;}h2{color:#c8cede;}\
+pre,code{background:#222836;}.footer{border-top-color:#2a3040;}}\
+"""
+
+
+def _plain_to_html(body: str) -> str:
+    """Render a plain-text body as a styled HTML alternative part.
+
+    Deliberately minimal: escape everything, then re-apply structure for the
+    constructs the briefs and reports actually use (ALERT lines, 'Label:' /
+    'Label,' section heads, EVALUATION/RECOMMENDATION lines, code fences,
+    numbered/bulleted lists, and paragraphs). No external assets, so Gmail
+    strips nothing.
+    """
+    import html as _html
+
+    def _esc(s: str) -> str:
+        return _html.escape(s, quote=False)
+
+    lines_in = body.splitlines()
+    out: List[str] = []
+    in_code = False
+    code_buf: List[str] = []
+    para_buf: List[str] = []
+
+    def flush_para() -> None:
+        if para_buf:
+            out.append("<p>" + "<br>".join(_esc(l) for l in para_buf) + "</p>")
+            para_buf.clear()
+
+    for raw in lines_in:
+        stripped = raw.strip()
+        if stripped.startswith("```"):
+            flush_para()
+            if in_code:
+                out.append("<pre><code>" + "\n".join(_esc(l) for l in code_buf) + "</code></pre>")
+                code_buf.clear()
+                in_code = False
+            else:
+                in_code = True
+            continue
+        if in_code:
+            code_buf.append(raw)
+            continue
+        if not stripped:
+            flush_para()
+            continue
+        upper = stripped.upper()
+        if stripped == "ALERT" or upper.startswith("ALERT"):
+            flush_para()
+            out.append('<div class="alert">' + _esc(stripped) + "</div>")
+            continue
+        if upper.startswith(("EVALUATION:", "RECOMMENDATION:")):
+            flush_para()
+            cls = "rec"
+            label, _, rest = stripped.partition(":")
+            out.append(f'<div class="{cls}"><span class="label">{_esc(label)}</span><br>{_esc(rest.strip())}</div>')
+            continue
+        import re as _re
+
+        if _re.match(r"^#{1,3}\s+", stripped):
+            flush_para()
+            out.append(f"<h2>{_esc(stripped.lstrip('# ').strip())}</h2>")
+            continue
+        if _re.match(r"^([-*]|\d+\.)\s+", stripped):
+            flush_para()
+            out.append(f'<p class="status">{_esc(stripped)}</p>')
+            continue
+        para_buf.append(raw)
+    flush_para()
+    if in_code and code_buf:  # unterminated fence: emit what we have
+        out.append("<pre><code>" + "\n".join(_esc(l) for l in code_buf) + "</code></pre>")
+    return "".join(out)
+
+
+def _build_email_body(msg: MIMEMultipart, body: str) -> None:
+    """Attach the plain part first, then a styled HTML alternative (MIME order matters:
+    clients that prefer HTML take the last alternative; plain stays for everything else)."""
+    alt = MIMEMultipart("alternative")
+    alt.attach(MIMEText(body, "plain", "utf-8"))
+    import datetime as _dt
+
+    date_line = _dt.datetime.now().strftime("%A, %B %d, %Y")
+    html = (
+        '<!DOCTYPE html><html><head><meta charset="utf-8">'
+        "<style>" + _EMAIL_HTML_STYLE + "</style></head><body><div class='container'>"
+        "<div class='header'><div class='brand'>Hermes Agent</div>"
+        f"<div class='date'>{date_line}</div></div>"
+        + _plain_to_html(body)
+        + "<div class='footer'>Sent by Hermes Agent &middot; replies go to the agent</div>"
+        "</div></body></html>"
+    )
+    alt.attach(MIMEText(html, "html", "utf-8"))
+    msg.attach(alt)
+
+
 class EmailAdapter(BasePlatformAdapter):
     """Email gateway adapter using IMAP (receive) and SMTP (send)."""
     # One email carries the whole body, so cron delivery hands over the full payload untruncated.
@@ -871,7 +983,7 @@ class EmailAdapter(BasePlatformAdapter):
                            ("Date", formatdate(localtime=True)), ("Message-ID", msg_id)):
             msg[key] = value
         if body or attach_empty_body:
-            msg.attach(MIMEText(body, "plain", "utf-8"))
+            _build_email_body(msg, body)
         return msg, msg_id, subject
 
     def _smtp_send(self, msg: MIMEMultipart) -> None:
