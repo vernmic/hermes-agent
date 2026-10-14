@@ -47,3 +47,17 @@ def test_selector_failure_discards_candidates_without_hiding_legacy(monkeypatch)
     monkeypatch.setattr(turn_selection, '_plans', lambda **kwargs: [
         {'apply': True, 'feed': {'query': 'task'}, 'context': '', 'select_results': broken}])
     assert turn_selection.select_turn_context(agent, [], 'task', lambda: 'baseline') == ('legacy text', '')
+
+
+def test_legacy_prefetch_notifies_provider_once():
+    from agent.turn_context import _memory_turn_start_and_prefetch
+    calls = []
+    manager = SimpleNamespace(
+        on_turn_start=lambda *a, **k: calls.append(('notify', a, k)),
+        prefetch_all=lambda query, **k: calls.append(('prefetch', query, k)) or 'recalled',
+        describe_recall=lambda: '',
+    )
+    agent = SimpleNamespace(_memory_manager=manager, _user_turn_count=2, session_id='s')
+    assert _memory_turn_start_and_prefetch(agent, 'Investigate upgrade compatibility', {'id': 'owner'}) == 'recalled'
+    assert [c[0] for c in calls] == ['notify', 'prefetch']
+    assert calls[0][2]['author_id'] == 'owner'
