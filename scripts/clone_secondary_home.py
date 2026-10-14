@@ -75,13 +75,13 @@ def clone_home(source, target, api_url, ui_url, *, resume=False):
     jobs_path = source / 'cron/jobs.json'
     paused = 0
     if jobs_path.exists():
-        jobs = json.loads(jobs_path.read_text())
+        jobs = json.loads(jobs_path.read_text(encoding='utf-8'))
         for job in jobs.get('jobs', []):
             job.update(enabled=False, state='paused', paused_reason='Hermes2 dashboard/CLI deployment; avoid duplicate production jobs',
                        paused_at=datetime.datetime.now(datetime.timezone.utc).isoformat())
             paused += 1
         (target / 'cron').mkdir(exist_ok=True)
-        (target / 'cron/jobs.json').write_text(json.dumps(jobs, indent=2))
+        (target / 'cron/jobs.json').write_text(json.dumps(jobs, indent=2), encoding='utf-8')
     for directory in ('logs', 'sessions', 'workspace', 'state'):
         (target / directory).mkdir(exist_ok=True)
     for secret in (target / '.env', target / 'auth.json'):
@@ -110,7 +110,7 @@ def main():
     for profile in sorted((source / 'profiles').iterdir()):
         if profile.name.startswith('.') or not (profile / 'config.yaml').is_file(): continue
         records.append(clone_home(profile, target / 'profiles' / profile.name, args.api_url, args.ui_url, resume=args.resume))
-    args.receipt.write_text(json.dumps({'profiles': records}, indent=2))
+    args.receipt.write_text(json.dumps({'profiles': records}, indent=2), encoding='utf-8')
     print(json.dumps({'profiles': len(records), 'skills': sum(r['skills'] for r in records),
                       'paused_jobs': sum(r['paused_jobs'] for r in records)}))
 
