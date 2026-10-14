@@ -78,7 +78,7 @@ def clone_home(source, target, api_url, ui_url, *, resume=False):
         jobs = json.loads(jobs_path.read_text(encoding='utf-8'))
         for job in jobs.get('jobs', []):
             job.update(enabled=False, state='paused', paused_reason='Hermes2 dashboard/CLI deployment; avoid duplicate production jobs',
-                       paused_at=datetime.datetime.now(datetime.timezone.utc).isoformat())
+                       paused_at=datetime.datetime.now(datetime.UTC).isoformat())
             paused += 1
         (target / 'cron').mkdir(exist_ok=True)
         (target / 'cron/jobs.json').write_text(json.dumps(jobs, indent=2), encoding='utf-8')
