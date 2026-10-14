@@ -58,6 +58,16 @@ def clone_home(source, target, api_url, ui_url, *, resume=False):
             continue
         for before, after in replacements:
             text = re.sub(re.escape(before) + r"(?![A-Za-z0-9_.-])", lambda m: after, text)
+        if 'scripts' in p.relative_to(target).parts:
+            # Copied instance controls must never start, stop or probe Hermes1.
+            for before, after in (
+                ('/home/vern/.local/bin/hermes', '/home/vern/.local/bin/hermes2'),
+                ('.local/bin/hermes', '.local/bin/hermes2'),
+                ('hermes-gateway', 'hermes2-gateway'),
+                ('hermes-dashboard', 'hermes2-dashboard'),
+                ('9119', '9120'),
+            ):
+                text = re.sub(re.escape(before) + r'(?![A-Za-z0-9_.-])', lambda m: after, text)
         if p.name == '.env':
             text = '\n'.join(l for l in text.splitlines()
                              if not l.split('=', 1)[0].startswith(MESSAGING_PREFIXES)) + '\n'

@@ -54,3 +54,17 @@ def test_secondary_profile_root_a_b_a(tmp_path, monkeypatch):
         monkeypatch.setenv('HERMES_HOME', str(root))
         assert _get_profiles_root() == root / 'profiles'
         assert get_profile_dir('coder') == root / 'profiles/coder'
+
+
+def test_copied_controls_target_secondary_instance(tmp_path):
+    source, target = tmp_path / 'first', tmp_path / 'second'
+    (source / 'scripts').mkdir(parents=True)
+    (source / 'config.yaml').write_text('model: {}\n')
+    control = source / 'scripts/control.sh'
+    original = '/home/vern/.local/bin/hermes gateway run; hermes-gateway; hermes-dashboard; http://localhost:9119; /home/vern/.local/bin/hermes2'
+    control.write_text(original)
+    clone_home(source, target, 'http://localhost:8889', 'http://localhost:9998')
+    copied = (target / 'scripts/control.sh').read_text()
+    assert copied == original.replace('/home/vern/.local/bin/hermes ', '/home/vern/.local/bin/hermes2 ').replace('hermes-gateway', 'hermes2-gateway').replace('hermes-dashboard', 'hermes2-dashboard').replace(':9119', ':9120')
+    assert control.read_text() == original
+    assert 'hermes22' not in copied
