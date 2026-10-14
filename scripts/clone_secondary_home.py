@@ -32,7 +32,7 @@ def clone_home(source, target, api_url, ui_url):
         if (source / name).is_dir():
             shutil.copytree(source / name, target / name,
                             ignore=shutil.ignore_patterns('__pycache__', '.git', '*.lock', '*.bak*'),
-                            dirs_exist_ok=False)
+                            dirs_exist_ok=True)
     replacements = ((str(source.parent.parent) if source.parent.name == 'profiles' else str(source),
                      str(target.parent.parent) if target.parent.name == 'profiles' else str(target)),
                     ('http://host.docker.internal:8888', api_url),

@@ -67,3 +67,20 @@ calling a deployment healthy. Custom homes, commands, ports, poll intervals,
 grace and cooldown values are explicit CLI arguments. Runtime locks, markers,
 logs and backups remain local. Run the isolated lifecycle tests through
 `scripts/run_tests.sh tests/scripts/test_dashboard_watchdog.py`.
+
+A secondary dashboard uses the same guardian with a distinct home, port, tmux
+session and launcher. For example, after configuring `~/.hermes2` and installing
+`~/.local/bin/hermes2`:
+
+```powershell
+.\scripts\install_dashboard_watchdog.ps1 -TaskName 'Hermes2 Dashboard Watchdog' `
+  -Distribution Ubuntu -LinuxUser vern -LinuxHome /home/vern/.hermes2 `
+  -Port 9120 -Session hermes2-dashboard `
+  -Command '/home/vern/.local/bin/hermes2 dashboard --no-open --skip-build --host 127.0.0.1 --port 9120'
+```
+
+`clone_secondary_home.py` copies live profiles, credentials, identity and skills
+locally and retargets their memory endpoint. It creates fresh session/task state,
+pauses copied schedules and removes messaging credentials from the second home.
+Use it before the secondary home has a config. It never starts a gateway.
+Receipts must stay local because model configurations can contain private URLs.
