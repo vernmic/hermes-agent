@@ -417,23 +417,40 @@ def test_flat_action_declined_is_refused_without_effect(host, action, monkeypatc
 # ---------------------------------------------------------------- uncovered entry points (gaps)
 
 
-def test_gap_direct_handlers_bypass_required_policy(host):
-    """Dashboard ``POST /api/skills`` / ``PUT /api/skills/content`` and
-    ``agent.learning_mutations`` call ``_create_skill`` / ``_edit_skill`` directly.
-    With a required policy configured and NO policy plugin present, those entries still
-    mutate and ``pre_skill_batch`` is never dispatched."""
+def test_excluded_mode_human_direct_edits_do_not_consult_policy(host):
+    """Excluded mode (W02 boundary): the dashboard (``POST /api/skills``,
+    ``PUT /api/skills/content``) and journey edits (``agent.learning_mutations``) are
+    deliberate human writes that call the helpers directly. Required mode does not gate
+    them and no policy is dispatched; this pins that boundary through the real dashboard
+    create route and journey edit. ``PUT /api/skills/content`` uses the same ``_edit_skill``
+    helper under a profile scope this harness does not model (source-inspected)."""
+    import asyncio
+
+    from agent import learning_mutations
+    from hermes_cli.web_routers import skills as dashboard
+
+    host.seed()
     host.require_policy()
-    created = host.smt._create_skill("direct-skill", skill_md("direct-skill"))
-    edited = host.smt._edit_skill("direct-skill", skill_md("direct-skill", "Step 1: Direct edit."))
-    assert created["success"] is True and edited["success"] is True
-    assert "Direct edit." in (host.root / "direct-skill" / "SKILL.md").read_text(encoding="utf-8")
+    consumer = host.install(SyntheticConsumer(host.root))
+    created = asyncio.run(dashboard.create_skill(dashboard.SkillCreate(
+        name="direct-skill", content=skill_md("direct-skill"))))
+    assert created["success"] is True, created
+    edited = learning_mutations.edit_node("probe-skill", skill_md("probe-skill", "Step 1: Journey edit."))
+    assert edited["ok"] is True, edited
+    assert "Journey edit." in (host.root / "probe-skill" / "SKILL.md").read_text(encoding="utf-8")
+    assert consumer.calls == []
 
 
-def test_gap_legacy_staged_replay_without_digest_skips_required_policy(host):
-    """A staged record without ``payload_digest`` (e.g. staged before the policy became
-    required) replays through ``apply_skill_pending`` without any policy decision."""
+def test_required_policy_refuses_undigested_staged_replay(host):
+    """A staged record without ``payload_digest`` has no policy decision to replay. With
+    ``skill_policy.required`` set, ``/skills approve`` refuses it (stage again for a fresh
+    decision); without required mode legacy records replay unchanged."""
+    from hermes_cli.write_approval_commands import _apply_one
+    from tools import write_approval as wa
+
+    legacy = {"payload": {"action": "create", "name": "replayed-skill",
+                          "content": skill_md("replayed-skill")}}
     host.require_policy()
-    result = json.loads(host.smt.apply_skill_pending(
-        {"action": "create", "name": "replayed-skill", "content": skill_md("replayed-skill")}))
-    assert result["success"] is True, result
-    assert (host.root / "replayed-skill" / "SKILL.md").is_file()
+    ok, error, _ = _apply_one(wa.SKILLS, legacy, None)
+    assert not ok and "no payload binding" in error
+    assert not (host.root / "replayed-skill").exists()

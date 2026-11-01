@@ -1132,7 +1132,9 @@ def _verify_staged_batch_digest(payload: Dict[str, Any]) -> Optional[str]:
     recorded = payload.get("payload_digest")
     operations = payload.get("operations")
     if not isinstance(recorded, str) or not recorded:
-        return None  # not a digest-bound record: legacy staged writes replay unchanged
+        # Legacy record: replays unchanged unless a policy is required, which it never saw.
+        return ("Staged skill write has no payload binding and skill_policy.required is set; "
+                "stage it again for a fresh policy decision.") if _required_skill_policy_hook() else None
     if operations is None:
         # A digest-bound staged FLAT single op: rebuild the equivalent operation from
         # the flat fields with the same construction rule used at stage time.
