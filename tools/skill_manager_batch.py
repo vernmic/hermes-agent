@@ -236,12 +236,8 @@ def _skill_manage_batch(operations, default_name: str | None = None, task_id: st
         nm = operations[0].get("name") or default_name
         if not nm:
             return tool_error("operations[0] (delete) needs a 'name'.", success=False)
-        if not _smt._skill_gate_bypass.get():
-            # The operations[] shape is one call = one whole-batch decision, even when
-            # the single op routes to the sole-delete path below.
-            refusal, _approved_digest = _smt._gate_skill_batch(operations)
-            if refusal is not None:
-                return json.dumps(refusal, ensure_ascii=False)
+        # One judgment: the flat path below runs the single pre_skill_batch decision on
+        # the flat-equivalent payload and binds that digest into its staged record.
         return _smt.skill_manage(action="delete", name=nm, task_id=task_id, session_id=session_id,
                                  absorbed_into=operations[0].get("absorbed_into"))
     names, err = _validate_batch_ops(operations, default_name, tool_error)

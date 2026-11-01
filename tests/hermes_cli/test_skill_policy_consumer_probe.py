@@ -112,6 +112,7 @@ def host(tmp_path, monkeypatch):
     monkeypatch.setattr(plugins_mod, "_plugin_managers_by_home", {})
     root = tmp_path / "skills"
     root.mkdir()
+    native = SimpleNamespace(write_gate=smt._run_write_gate, record_success=smt._record_success)
     with (
         patch("tools.skill_manager_tool.SKILLS_DIR", root),
         patch("agent.skill_utils.get_all_skills_dirs", return_value=[root]),
@@ -123,9 +124,9 @@ def host(tmp_path, monkeypatch):
         assert not has_hook(POLICY_HOOK), "HARNESS: a policy hook leaked into the isolated host"
         assert smt._required_skill_policy_hook() is None, "HARNESS: skill_policy.required leaked in"
 
-        def require_policy():
+        def require_policy(extra: str = ""):
             from hermes_cli.config import get_config_path
-            get_config_path().write_text(f"skill_policy:\n  required: {POLICY_HOOK}\n", encoding="utf-8")
+            get_config_path().write_text(f"skill_policy:\n  required: {POLICY_HOOK}\n{extra}", encoding="utf-8")
             assert smt._required_skill_policy_hook() == POLICY_HOOK, \
                 "HARNESS: real config read did not return skill_policy.required"
 
@@ -143,7 +144,7 @@ def host(tmp_path, monkeypatch):
             note.write_text("note", encoding="utf-8")
 
         yield SimpleNamespace(root=root, smt=smt, require_policy=require_policy,
-                              install=install, seed=seed)
+                              install=install, seed=seed, native=native)
 
 
 def run_batch(smt, ops):
@@ -311,24 +312,64 @@ def test_batch_full_rewrite_and_remove_file_are_one_decision(host):
     assert not (host.root / "probe-skill" / "references" / "note.md").exists()
 
 
-def test_gap_sole_delete_operations_shape_is_judged_twice(host):
-    """Contract deviation: the sole-delete operations[] route gates the batch once and then
-    calls the flat ``skill_manage(action="delete")`` WITHOUT the batch bypass, so the flat
-    gate dispatches ``pre_skill_batch`` a second time with a differently shaped single-op
-    payload (and a different digest). Every other operations[] call is judged exactly once."""
+SOLE_DELETE = [{"name": "probe-skill", "action": "delete", "absorbed_into": ""}]
+
+
+def test_sole_delete_operations_shape_is_judged_once_on_the_flat_payload(host):
+    """W02-H1: the sole-delete operations[] call is ONE judgment. The batch route hands the
+    op to flat ``skill_manage(action="delete")``, whose single gate judges the flat-equivalent
+    payload (``_flat_gate_operation``) - the same rule the staged record is re-hashed with."""
     host.seed()
     host.require_policy()
     consumer = host.install(SyntheticConsumer(host.root))
-    ops = [{"name": "probe-skill", "action": "delete", "absorbed_into": ""}]
-    result = run_batch(host.smt, ops)
+    result = run_batch(host.smt, SOLE_DELETE)
     assert result["success"] is True, result
-    assert len(consumer.calls) == 2
-    first, second = consumer.calls
-    assert first["operations"] == ops
-    assert first["payload_digest"] == host.smt._skill_batch_payload_digest(ops)
-    (flat_op,) = second["operations"]
-    assert flat_op["action"] == "delete" and flat_op["name"] == "probe-skill"
-    assert second["payload_digest"] != first["payload_digest"]
+    (call,) = consumer.calls
+    flat_op = host.smt._flat_gate_operation(
+        "delete", "probe-skill", {"absorbed_into": "", "replace_all": False})
+    assert call["operations"] == [flat_op]
+    assert call["payload_digest"] == host.smt._skill_batch_payload_digest([flat_op])
+    assert not (host.root / "probe-skill").exists()
+
+
+def _staged_skill_records():
+    from tools import write_approval as wa
+    return wa.list_pending(wa.SKILLS)
+
+
+def test_sole_delete_native_staging_replay_and_tamper(host):
+    """W02-H1 on the native path: real write-approval staging, real ``/skills approve``
+    applier (``_apply_one`` -> ``apply_skill_pending``) and real success bookkeeping."""
+    from hermes_cli.write_approval_commands import _apply_one
+    from tools import write_approval as wa
+
+    host.seed()
+    host.require_policy("skills:\n  write_approval: true\n")
+    consumer = host.install(SyntheticConsumer(host.root))
+    with patch.object(host.smt, "_run_write_gate", host.native.write_gate), \
+            patch.object(host.smt, "_record_success", host.native.record_success):
+        staged = run_batch(host.smt, SOLE_DELETE)
+        assert staged.get("staged") is True, staged
+        (call,) = consumer.calls
+        (rec,) = _staged_skill_records()
+        assert rec["payload"]["payload_digest"] == call["payload_digest"]
+        assert (host.root / "probe-skill" / "SKILL.md").is_file()  # nothing deleted yet
+
+        tampered = dict(rec, payload=dict(rec["payload"], absorbed_into="other-skill"))
+        ok, error, _ = _apply_one(wa.SKILLS, tampered, None)
+        assert not ok and "payload binding" in error
+        assert (host.root / "probe-skill" / "SKILL.md").is_file()
+
+        ok, error, _ = _apply_one(wa.SKILLS, rec, None)
+        assert ok, error
+    assert len(consumer.calls) == 1  # replay never re-asks the policy
+    assert not (host.root / "probe-skill").exists()
+
+
+def test_sole_delete_without_policy_is_unchanged(host):
+    host.seed()
+    result = run_batch(host.smt, SOLE_DELETE)
+    assert result["success"] is True, result
     assert not (host.root / "probe-skill").exists()
 
 
