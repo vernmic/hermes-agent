@@ -293,6 +293,24 @@ def test_batch_rejects_edit_and_non_sole_delete_before_policy(host):
     assert tree(host.root) == before
 
 
+def test_batch_full_rewrite_and_remove_file_are_one_decision(host):
+    """operations[] has no edit: a full rewrite is patch+content. Together with remove_file
+    it is still one pre_skill_batch decision covering the whole payload."""
+    host.seed()
+    host.require_policy()
+    consumer = host.install(SyntheticConsumer(host.root))
+    rewritten = skill_md("probe-skill", "Step 1: Rewritten.")
+    ops = [{"name": "probe-skill", "action": "patch", "content": rewritten},
+           {"name": "probe-skill", "action": "remove_file", "file_path": "references/note.md"}]
+    result = run_batch(host.smt, ops)
+    assert result["success"] is True, result
+    assert len(consumer.calls) == 1
+    assert consumer.calls[0]["operations"] == ops
+    assert consumer.calls[0]["payload_digest"] == host.smt._skill_batch_payload_digest(ops)
+    assert (host.root / "probe-skill" / "SKILL.md").read_text(encoding="utf-8") == rewritten
+    assert not (host.root / "probe-skill" / "references" / "note.md").exists()
+
+
 def test_gap_sole_delete_operations_shape_is_judged_twice(host):
     """Contract deviation: the sole-delete operations[] route gates the batch once and then
     calls the flat ``skill_manage(action="delete")`` WITHOUT the batch bypass, so the flat
