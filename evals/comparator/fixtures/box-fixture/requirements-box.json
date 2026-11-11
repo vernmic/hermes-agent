@@ -1,0 +1,15 @@
+{
+  "schema": "grader-requirements/1",
+  "product_module": "box",
+  "requirements": [
+    {"id": "B1", "description": "put and get round-trip",
+     "static": {"class": "Box", "method": "put"},
+     "probes": ["put_get"]},
+    {"id": "B2", "description": "count reflects stored items",
+     "static": {"class": "Box", "method": "count"},
+     "probes": ["count"]},
+    {"id": "B3", "description": "clear empties the box",
+     "static": {"class": "Box"},
+     "probes": ["clear"]}
+  ]
+}

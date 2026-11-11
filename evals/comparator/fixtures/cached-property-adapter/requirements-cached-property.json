@@ -1,0 +1,124 @@
+{
+  "schema": "grader-requirements/1",
+  "product_module": "cached_property",
+  "requirements": [
+    {
+      "id": "R1",
+      "description": "instance memoization; cached None counts; per-instance values; non-TTL values do not expire",
+      "static": {
+        "class": "cached_property",
+        "method": "__get__"
+      },
+      "probes": [
+        "r1_memoizes",
+        "r1_per_instance",
+        "r1_none_computes_once"
+      ]
+    },
+    {
+      "id": "R2",
+      "description": "class access returns the decorator/descriptor object",
+      "static": {
+        "class": "cached_property",
+        "method": "__get__"
+      },
+      "probes": [
+        "r2_class_access"
+      ]
+    },
+    {
+      "id": "R3",
+      "description": "deleting the cached attribute resets it",
+      "static": {
+        "class": "cached_property"
+      },
+      "probes": [
+        "r3_delete_resets"
+      ]
+    },
+    {
+      "id": "R4",
+      "description": "assignment overrides without computing",
+      "static": {
+        "class": "cached_property"
+      },
+      "probes": [
+        "r4_assignment"
+      ]
+    },
+    {
+      "id": "R5",
+      "description": "coroutine property yields one shared awaited result",
+      "static": {
+        "class": "cached_property"
+      },
+      "probes": [
+        "r5_coroutine_shared"
+      ]
+    },
+    {
+      "id": "R6",
+      "description": "one computation under a genuine multi-thread first-access race",
+      "static": {
+        "class": "threaded_cached_property"
+      },
+      "probes": [
+        "r6_single_compute"
+      ]
+    },
+    {
+      "id": "R7",
+      "description": "expired TTL recomputes on next access",
+      "static": {
+        "class": "cached_property_with_ttl"
+      },
+      "probes": [
+        "r7_expiry_recomputes"
+      ]
+    },
+    {
+      "id": "R8",
+      "description": "threaded TTL single computation including after expiry",
+      "static": {
+        "class": "threaded_cached_property_with_ttl"
+      },
+      "probes": [
+        "r8_race_after_expiry"
+      ]
+    },
+    {
+      "id": "R9",
+      "description": "bare, empty, positional and ttl= decoration forms on both TTL decorators",
+      "static": {
+        "class": "cached_property_with_ttl"
+      },
+      "probes": [
+        "r9_plain_bare",
+        "r9_plain_empty",
+        "r9_plain_positional",
+        "r9_plain_kw",
+        "r9_threaded_bare",
+        "r9_threaded_empty",
+        "r9_threaded_positional",
+        "r9_threaded_kw"
+      ]
+    },
+    {
+      "id": "R10",
+      "description": "all four public names importable from the product module (re-exports valid)",
+      "static": {},
+      "probes": [
+        "import_surface"
+      ],
+      "anchor": {
+        "kind": "public_names",
+        "names": [
+          "cached_property",
+          "threaded_cached_property",
+          "cached_property_with_ttl",
+          "threaded_cached_property_with_ttl"
+        ]
+      }
+    }
+  ]
+}
