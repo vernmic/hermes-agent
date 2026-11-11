@@ -19,6 +19,20 @@ Fixes over v1 per the R08 independent review:
   R08-5 the judge mandatory_status must match the declared requirement ID
       set exactly (no missing, no extra, correct types).
 
+v5 (import roots): original_dir/candidate_dir stay FULL project roots for
+frozen identity, graph/source mapping and judge material, while optional
+original_import_root/candidate_import_root (project-relative, default
+".") explicitly select each product's Python import root for EXECUTION:
+the benchmark gate --candidate and the probe script argument both receive
+the selected source directory. Roots are validated fail-closed (no
+absolute/traversal/tilde paths, must exist inside the declared product,
+symlinks may not escape it); there is no auto-install or heuristic
+fallback. The execution-root policy and per-product execution identities
+are recorded in the receipt and bound into input_bundle_sha256, so a
+judge response minted for one execution root can never certify another
+(this is a versioned bundle-material change; pre-v5 judge hashes are
+stale and must not be reused).
+
 Gate script and interpreter are explicit config keys (native-resolved), not
 hardcoded user paths. Exit codes: 0 grade composed, 2 blocked.
 ASCII only.
@@ -35,7 +49,7 @@ import time
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
-SCHEMA = "grader-comparison/4"
+SCHEMA = "grader-comparison/5"
 WEIGHTS = {"structural": 0.4, "test": 0.4, "judge": 0.2}
 
 
@@ -108,6 +122,50 @@ def load_config(path):
     if not cfg["expected_probe_keys"]:
         raise SystemExit("expected_probe_keys must be non-empty")
     return cfg
+
+
+def resolve_import_root(product_dir, rel, which):
+    """Validate and resolve an execution import root INSIDE the declared
+    product (fail closed): project-relative, no absolute/traversal/tilde
+    components, must exist as a directory, and symlinks may not escape
+    the product root. Returns the resolved execution directory."""
+    if rel is None:
+        rel = "."
+    if not isinstance(rel, str) or not rel.strip():
+        raise SystemExit(f"{which}_import_root must be a non-empty string")
+    rel = rel.strip()
+    if rel.startswith(("/", "~")) or (len(rel) > 1 and rel[1] == ":"):
+        raise SystemExit(f"{which}_import_root must be project-relative: {rel!r}")
+    parts = Path(rel).parts
+    if ".." in parts or Path(rel).is_absolute():
+        raise SystemExit(f"{which}_import_root must not traverse: {rel!r}")
+    product = Path(product_dir).resolve()
+    execution = (product / rel).resolve()
+    if execution == product and rel not in (".", "./"):
+        raise SystemExit(f"{which}_import_root does not resolve inside the product: {rel!r}")
+    if execution != product and product not in execution.parents:
+        raise SystemExit(
+            f"{which}_import_root escapes the declared product "
+            f"(symlink or traversal): {rel!r}"
+        )
+    if not execution.is_dir():
+        raise SystemExit(f"{which}_import_root directory not found: {rel!r}")
+    return execution
+
+
+def execution_projection(cfg):
+    """Resolve both products' execution import roots and record the
+    projection. Full project roots stay the identity/graph/judge basis."""
+    projection = {}
+    for label in ("original", "candidate"):
+        rel = cfg.get(f"{label}_import_root", ".")
+        execution = resolve_import_root(cfg[f"{label}_dir"], rel, label)
+        projection[label] = {
+            "import_root": rel if isinstance(rel, str) else ".",
+            "project_root": str(Path(cfg[f"{label}_dir"]).resolve()),
+            "execution_dir": str(execution),
+        }
+    return projection
 
 
 def run_gate(cfg, candidate, tests, label, work, junit_path):
@@ -376,11 +434,14 @@ def run_oracle_phase(cfg, work):
     interpreter, --log/--logs-dir, JUnit identities)."""
     ref_junit = work / "junit-ref.xml"
     cand_junit = work / "junit-cand.xml"
+    exec_dirs = cfg["_execution_projection"]
     ref = run_gate(
-        cfg, cfg["original_dir"], cfg["oracle_tests"], "ref", work, ref_junit
+        cfg, exec_dirs["original"]["execution_dir"],
+        cfg["oracle_tests"], "ref", work, ref_junit,
     )
     cand = run_gate(
-        cfg, cfg["candidate_dir"], cfg["oracle_tests"], "cand", work, cand_junit
+        cfg, exec_dirs["candidate"]["execution_dir"],
+        cfg["oracle_tests"], "cand", work, cand_junit,
     )
     ref_tests, cand_tests = parse_junit(ref_junit), parse_junit(cand_junit)
     reasons = []
@@ -438,10 +499,11 @@ def score_tests(ref_tests, cand_tests):
 def run_probe_phase(cfg, work):
     """Stage 4: probes with complete schema + exit qualification."""
     probes, reasons = {}, []
+    exec_dirs = cfg["_execution_projection"]
     for label in ("original", "candidate"):
         probes[label] = run_probes(
             cfg["probe_script"],
-            cfg[f"{label}_dir"],
+            exec_dirs[label]["execution_dir"],
             cfg["expected_probe_keys"],
             work,
             label,
@@ -559,11 +621,25 @@ def build_structural(cfg, graphs, probes):
     return struct, reasons
 
 
-def build_bundle(ident_before, test_detail, probes, graphs, struct_scores):
-    """Stage 8a: the frozen evidence bundle hash binding the judge."""
+def build_bundle(ident_before, test_detail, probes, graphs, struct_scores,
+                 projection=None):
+    """Stage 8a: the frozen evidence bundle hash binding the judge. Since
+    v5 the material also binds the execution-root policy (project-relative
+    import roots) and each execution directory's content identity, so a
+    stale judge cannot certify a different execution root."""
     bundle_material = json.dumps(
         {
             "identity": ident_before,
+            "import_roots": (
+                {k: v["import_root"] for k, v in (projection or {}).items()}
+                if projection
+                else None
+            ),
+            "execution_identity": (
+                {k: tree_sha(v["execution_dir"]) for k, v in (projection or {}).items()}
+                if projection
+                else None
+            ),
             "test_detail": test_detail,
             "probes": {k: v.get("results") for k, v in probes.items()},
             "structural_scores": struct_scores,
@@ -633,13 +709,19 @@ def main():
     ap.add_argument("--judge-response", default="")
     args = ap.parse_args()
     cfg = load_config(args.config)
+    projection = execution_projection(cfg)
+    cfg["_execution_projection"] = projection
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     work = Path(tempfile.mkdtemp(prefix="cmp2-", dir=str(out)))
     receipts = {
         "schema": SCHEMA,
         "started_utc": now(),
-        "config_paths": {k: cfg[k] for k in cfg if k != "expected_identities"},
+        "config_paths": {
+            k: cfg[k] for k in cfg
+            if k not in ("expected_identities", "_execution_projection")
+        },
+        "execution_projection": projection,
     }
     reasons = []
 
@@ -683,7 +765,9 @@ def main():
 
     req_doc = json.loads(Path(cfg["requirements"]).read_text())
     expected_ids = [r["id"] for r in req_doc["requirements"]]
-    bundle_sha = build_bundle(ident_before, test_detail, probes, graphs, struct_scores)
+    bundle_sha = build_bundle(
+        ident_before, test_detail, probes, graphs, struct_scores, projection
+    )
     receipts["input_bundle_sha256"] = bundle_sha
     if args.judge_response and Path(args.judge_response).exists():
         judge_parsed, judge_issues = validate_judge(

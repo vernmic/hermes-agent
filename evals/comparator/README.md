@@ -56,3 +56,30 @@ replacement gate is a regression, not a substitute.
 Alternative valid architectures (function factories, private descriptors,
 facade classes) anchor identically - no class layout is ever imposed, and
 graph counts are context, never quality.
+
+## Execution import roots (v5)
+
+`original_dir`/`candidate_dir` remain FULL project roots: frozen
+identities, graph/source mapping and judge material always cover the
+whole project. Real projects differ in layout (a src-layout reference
+vs a flat candidate, or the reverse); the optional config keys
+
+- `original_import_root` (project-relative, default `"."`)
+- `candidate_import_root` (project-relative, default `"."`)
+
+explicitly select each product's Python import root for EXECUTION: the
+benchmark gate's `--candidate` and the probe script argument both
+receive that selected source directory, never a silently guessed root.
+Roots are validated fail-closed before anything executes: no absolute,
+tilde or `..` traversal paths; the directory must exist inside the
+DECLARED product; symlinks may not escape it. There is no auto-install
+and no heuristic global fallback - a missing root is a configuration
+error, not a fallback trigger.
+
+The receipt records `execution_projection` per product (import_root,
+project_root, execution_dir), and the versioned bundle material
+(grader-comparison/5) now includes the import-root policy plus each
+execution directory's content identity inside `input_bundle_sha256`:
+a judge response minted for one execution root can never certify
+another. Judge hashes from pre-v5 bundles are stale and must not be
+reused as fresh proofs.
