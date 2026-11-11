@@ -22,7 +22,7 @@ replacement gate is a regression, not a substitute.
 
 ## Layout
 
-- `compare_products.py` - CLI composer (grader-comparison/5):
+- `compare_products.py` - CLI composer (grader-comparison/6):
   `python compare_products.py --config cfg.json --out dir
   [--judge-response resp.json]`. Structural 0.4 / tests 0.4 / judge 0.2.
 - `graph_compare.py` - Graphify-output mapper (grader-graph/4): qualified
@@ -78,8 +78,34 @@ error, not a fallback trigger.
 
 The receipt records `execution_projection` per product (import_root,
 project_root, execution_dir), and the versioned bundle material
-(grader-comparison/5) now includes the import-root policy plus each
+(revised bundle format, now grader-comparison/6) includes the
+import-root policy, the oracle-manifest policy with every allowlisted
+resource identity, the probe interpreters, and each
 execution directory's content identity inside `input_bundle_sha256`:
 a judge response minted for one execution root can never certify
 another. Judge hashes from pre-v5 bundles are stale and must not be
 reused as fresh proofs.
+
+## Trusted oracle manifests (v5b)
+
+Some upstream suites need trusted sibling resources the gate's
+name-filtered staging drops (package `tests/__init__.py` mixins, helper
+modules, out-of-tree data files). The optional frozen config key
+`oracle_manifest` points at an `oracle-staging/1` manifest (see
+evals/benchmark_gates/gate1_pytest.py): trusted oracle PROJECT root,
+selected tests path, a concrete project-relative FILE allowlist with
+REQUIRED per-file sha256, and declared target import module names. In
+manifest mode `oracle_tests` must BE the manifest's oracle project
+tests directory (the gate enforces the equality); only allowlisted
+hash-verified files are staged under `_gate_oracle/` with
+oracle-project-relative paths preserved (`tests/../x` resolves
+faithfully), and declared targets must be observed at runtime from
+staged CANDIDATE code (a copied reference target blocks as
+target_from_oracle; a never-imported target blocks as target_missing).
+The manifest file joins the frozen identity set (pre/post) and the
+manifest policy plus every resource identity is hashed into
+`input_bundle_sha256`: a changed helper, data file or staging policy
+cannot reuse a prior judge authorization. Probes run under the
+configured `pinned_python` (the same explicit interpreter the gate
+uses), recorded per product and bound into the bundle -- probe and
+test runtimes are coherent by construction.
