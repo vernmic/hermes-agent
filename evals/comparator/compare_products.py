@@ -19,6 +19,21 @@ Fixes over v1 per the R08 independent review:
   R08-5 the judge mandatory_status must match the declared requirement ID
       set exactly (no missing, no extra, correct types).
 
+v6 (bundle-material revision; covers the former draft "5b"): the frozen
+judge bundle now includes the execution-root policy, the oracle-manifest
+policy with every allowlisted resource identity, and the probe
+interpreters. Judge responses minted under grader-comparison/4 or /5
+hashes are stale and must never be reused as fresh proofs.
+
+v5b (oracle manifest + probe coherence): optional frozen oracle_manifest
+config (oracle-staging/1) is validated and passed EXPLICITLY to the gate
+(--oracle-manifest); its file identity joins pre/post qualification and
+the versioned input_bundle_sha256, so a changed helper/data file or
+staging policy cannot reuse a prior judge authorization. Probes now run
+under the configured pinned interpreter (the same explicit target the
+gate uses) instead of this process's sys.executable; the interpreter is
+recorded and bound into the bundle.
+
 v5 (import roots): original_dir/candidate_dir stay FULL project roots for
 frozen identity, graph/source mapping and judge material, while optional
 original_import_root/candidate_import_root (project-relative, default
@@ -49,7 +64,7 @@ import time
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
-SCHEMA = "grader-comparison/5"
+SCHEMA = "grader-comparison/6"
 WEIGHTS = {"structural": 0.4, "test": 0.4, "judge": 0.2}
 
 
@@ -121,6 +136,9 @@ def load_config(path):
             raise SystemExit(f"config path does not exist: {key}={cfg[key]}")
     if not cfg["expected_probe_keys"]:
         raise SystemExit("expected_probe_keys must be non-empty")
+    if cfg.get("oracle_manifest") and not Path(cfg["oracle_manifest"]).exists():
+        raise SystemExit(
+            f"config path does not exist: oracle_manifest={cfg['oracle_manifest']}")
     return cfg
 
 
@@ -203,6 +221,8 @@ def run_gate(cfg, candidate, tests, label, work, junit_path):
         "--logs-dir",
         str(logs_dir),
     ]
+    if cfg.get("oracle_manifest"):
+        cmd += ["--oracle-manifest", str(cfg["oracle_manifest"])]
     proc = subprocess.run(
         cmd,
         capture_output=True,
@@ -274,12 +294,16 @@ def origins_proven(gate_payload):
     return bool(good) and not bad
 
 
-def run_probes(probe_script, product, expected_keys, work, label):
+def run_probes(probe_script, product, expected_keys, work, label, python):
+    """Probes run under the EXPLICIT configured target interpreter (the
+    same pinned interpreter the gate uses), never this process's
+    sys.executable: when the two differ, target dependencies can differ.
+    The interpreter is recorded and bound into the judge bundle."""
     script = Path(probe_script).resolve()
     log = work / (f"probes-{label}.log")
     try:
         proc = subprocess.run(
-            [sys.executable, str(script), str(product)],
+            [str(python), str(script), str(product)],
             capture_output=True,
             text=True,
             timeout=600,
@@ -306,6 +330,7 @@ def run_probes(probe_script, product, expected_keys, work, label):
             "exit_code": rc,
             "results": None,
             "log": log.name,
+            "interpreter": str(python),
         }
     harness_errors = []
     values = {}
@@ -338,6 +363,7 @@ def run_probes(probe_script, product, expected_keys, work, label):
         "exit_code": rc,
         "results": values,
         "log": log.name,
+        "interpreter": str(python),
     }
 
 
@@ -416,10 +442,18 @@ FROZEN_KEYS = (
 )
 
 
+def frozen_keys_for(cfg):
+    """Frozen identity keys; the optional oracle manifest file joins the
+    frozen set exactly when it is configured."""
+    if cfg.get("oracle_manifest"):
+        return FROZEN_KEYS + ("oracle_manifest",)
+    return FROZEN_KEYS
+
+
 def verify_identities(cfg):
     """Stage 1: hash every frozen input before anything executes."""
     reasons, ident_before = [], {}
-    for key in FROZEN_KEYS:
+    for key in frozen_keys_for(cfg):
         ident_before[key] = tree_sha(cfg[key])
         if ident_before[key] is None:
             reasons.append(f"identity_unmeasured:{key}")
@@ -507,6 +541,7 @@ def run_probe_phase(cfg, work):
             cfg["expected_probe_keys"],
             work,
             label,
+            cfg["pinned_python"],
         )
         if not probes[label]["qualified"]:
             reasons.append(
@@ -621,8 +656,19 @@ def build_structural(cfg, graphs, probes):
     return struct, reasons
 
 
+def oracle_manifest_policy(cfg):
+    """Parsed + validated oracle-staging policy recorded and bound into
+    the bundle (None when no manifest is configured)."""
+    if not cfg.get("oracle_manifest"):
+        return None
+    sys.path.insert(0, str(Path(cfg["gate_script"]).resolve().parent))
+    import gate1_pytest as gate
+
+    return gate.load_oracle_manifest(cfg["oracle_manifest"])
+
+
 def build_bundle(ident_before, test_detail, probes, graphs, struct_scores,
-                 projection=None):
+                 projection=None, oracle_policy=None):
     """Stage 8a: the frozen evidence bundle hash binding the judge. Since
     v5 the material also binds the execution-root policy (project-relative
     import roots) and each execution directory's content identity, so a
@@ -633,6 +679,12 @@ def build_bundle(ident_before, test_detail, probes, graphs, struct_scores,
             "import_roots": (
                 {k: v["import_root"] for k, v in (projection or {}).items()}
                 if projection
+                else None
+            ),
+            "oracle_manifest": oracle_policy,
+            "probe_interpreters": (
+                {k: v.get("interpreter") for k, v in (probes or {}).items()}
+                if probes
                 else None
             ),
             "execution_identity": (
@@ -754,11 +806,14 @@ def main():
     receipts["structural"] = struct
     struct_scores = {k: struct[k].get("structural_score") for k in struct}
 
-    ident_after = {key: tree_sha(cfg[key]) for key in FROZEN_KEYS}
+    frozen = frozen_keys_for(cfg)
+    ident_after = {key: tree_sha(cfg[key]) for key in frozen}
     receipts["identity_after"] = ident_after
-    for key in FROZEN_KEYS:
+    for key in frozen:
         if ident_before[key] != ident_after[key]:
             reasons.append(f"identity_drift_during_run:{key}")
+    manifest_policy = oracle_manifest_policy(cfg)
+    receipts["oracle_manifest"] = manifest_policy
 
     receipts["qualification"] = {"reference_green": ref_green}
     receipts["test_detail"] = test_detail
@@ -766,7 +821,8 @@ def main():
     req_doc = json.loads(Path(cfg["requirements"]).read_text())
     expected_ids = [r["id"] for r in req_doc["requirements"]]
     bundle_sha = build_bundle(
-        ident_before, test_detail, probes, graphs, struct_scores, projection
+        ident_before, test_detail, probes, graphs, struct_scores, projection,
+        manifest_policy,
     )
     receipts["input_bundle_sha256"] = bundle_sha
     if args.judge_response and Path(args.judge_response).exists():
