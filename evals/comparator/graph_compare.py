@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Graphify output comparison v4 (grader-graph/4).
+"""Graphify output comparison v5 (grader-graph/5).
+
+Public-anchors extension (backward compatible): requirements may anchor
+implementations with anchor.kind=public_names name lists in addition to
+the legacy static.class single symbol; both resolve through the same
+AST-verified definition/alias/re-export resolution and span agreement.
 
 R12 correction: node identity and source span bind to the actual AST
 definition. A node's qualified identity (plain names, Class.member,
@@ -28,7 +33,7 @@ import re
 import sys
 from pathlib import Path
 
-SCHEMA = "grader-graph/4"
+SCHEMA = "grader-graph/5"
 
 
 class Unqualified(Exception):
@@ -259,12 +264,54 @@ def execution_verdict(req, probe_values):
     return "untested"
 
 
+def _requirement_symbols(req):
+    """Anchor symbols for a requirement, backward compatible.
+
+    Sources, in order: the legacy single-symbol ``static.class`` anchor
+    and neutral ``anchor.kind=public_names`` name lists (the product
+    contract shape; a public API name is a valid implementation anchor
+    whether the product implements it as a class, function, factory or
+    alias). Deduplicated, order-preserving, token-valid identifiers
+    only. Empty list means the requirement has no implementation
+    anchor: the graph phase reports no_evidence and the structural
+    phase decides via its explicit fallback policy.
+    """
+    symbols = []
+    static = req.get("static") or {}
+    if isinstance(static.get("class"), str) and static["class"].strip():
+        if static["class"] not in symbols:
+            symbols.append(static["class"])
+    anchor = req.get("anchor") or {}
+    if isinstance(anchor, dict) and anchor.get("kind") == "public_names":
+        names = anchor.get("names")
+        if isinstance(names, list):
+            for n in names:
+                if (
+                    isinstance(n, str)
+                    and IDENT_RE.match(n)
+                    and n not in symbols
+                ):
+                    symbols.append(n)
+    return symbols
+
+
 def map_requirement(req, node_by_id, anchors, edges_by_id, product_root, probe_values):
-    """Map one requirement against span-bound node evidence."""
-    symbol = (req.get("static") or {}).get("class")
+    """Map one requirement against span-bound node evidence.
+
+    R13/public-anchors: every declared anchor symbol (legacy
+    static.class plus anchor.kind=public_names names) is mapped with
+    the SAME definition/alias/re-export/qualified-member resolution and
+    span-agreement rules; per-symbol matches are merged and the merged
+    hits decide the verdict. A symbol match still requires a real
+    product definition with an agreeing source span - docs, tests,
+    wrong-file, wrong-line and name-prefix lookalike nodes never count
+    as implementation evidence.
+    """
+    symbols = _requirement_symbols(req)
     code_hits, context_hits = [], []
     anchored_ids = set()
-    if symbol:
+    matched_symbols = set()
+    for symbol in symbols:
         for meta in sorted(node_by_id.values(), key=lambda m: (m["id"], m["label"])):
             resolved_path = meta["resolved"]
             if not resolved_path or meta["evidence_kind"] != "code":
@@ -295,6 +342,7 @@ def map_requirement(req, node_by_id, anchors, edges_by_id, product_root, probe_v
                 context_hits.append(context_hit(meta, "span_mismatch", resolved))
                 continue
             anchored_ids.add(meta["id"])
+            matched_symbols.add(symbol)
             code_hits.append(
                 {
                     "id": meta["id"],
@@ -303,6 +351,7 @@ def map_requirement(req, node_by_id, anchors, edges_by_id, product_root, probe_v
                     "source_location": meta["source_location"],
                     "evidence_kind": meta["evidence_kind"],
                     "confidence": meta["confidence"],
+                    "symbol": symbol,
                     "anchor": {
                         "file": rel,
                         "name": name,
@@ -313,6 +362,15 @@ def map_requirement(req, node_by_id, anchors, edges_by_id, product_root, probe_v
                     "execution": execution_verdict(req, probe_values),
                 }
             )
+    # dedupe context hits that repeat for multiple symbols
+    seen_ctx = set()
+    deduped_ctx = []
+    for h in context_hits:
+        key = (h["id"], h["reason"])
+        if key not in seen_ctx:
+            seen_ctx.add(key)
+            deduped_ctx.append(h)
+    context_hits = deduped_ctx
     relationships = set()
     for nid in sorted(anchored_ids):
         for e in edges_by_id.get(nid, []):
@@ -341,7 +399,9 @@ def map_requirement(req, node_by_id, anchors, edges_by_id, product_root, probe_v
     else:
         verdict = "unverified_claim"
     return {
-        "symbol": symbol,
+        "symbol": symbols[0] if len(symbols) == 1 else None,
+        "symbols": symbols,
+        "matched_symbols": sorted(matched_symbols),
         "code_evidence": code_hits[:6],
         "context_evidence": context_hits[:6],
         "relationships": rel_list,
