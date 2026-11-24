@@ -88,6 +88,14 @@ def _open_control_dir() -> tuple[Path, bool]:
     return Path(tempfile.mkdtemp(prefix="hssh-", dir=min(roots, key=len))), True
 
 
+_MSYS_UNAME_PREFIXES = ("MINGW", "MSYS", "CYGWIN")
+
+
+def _windows_native_tar_enabled() -> bool:
+    """Opt-in gate (default off): extract bulk uploads with the native Windows tar on MSYS remotes."""
+    return os.environ.get("HERMES_SSH_WINDOWS_NATIVE_TAR", "").strip().lower() in ("1", "true", "yes", "on")
+
+
 class SSHEnvironment(BaseEnvironment):
     """Run commands on a remote machine over SSH.
 
@@ -232,6 +240,31 @@ class SSHEnvironment(BaseEnvironment):
         if result.returncode != 0:
             raise _sync_error(f"scp failed: {result.stderr.strip()}", f"File sync to {self.user}@{self.host}")
 
+    def _remote_is_msys(self) -> bool:
+        """True when the remote shell is MSYS/Git Bash on Windows (``uname -s`` = MINGW*/MSYS*/CYGWIN*).
+        Probed once, only when the native-tar gate is on; any probe failure counts as not MSYS."""
+        cached = getattr(self, "_remote_msys", None)
+        if cached is None:
+            cached = False
+            with contextlib.suppress(Exception):
+                result = self._run_ssh("uname -s", timeout=10)
+                if result.returncode == 0:
+                    cached = result.stdout.strip().upper().startswith(_MSYS_UNAME_PREFIXES)
+            self._remote_msys = cached
+        return cached
+
+    def _remote_extract_command(self, base: str) -> str:
+        """Remote side of the bulk-upload tar pipe."""
+        if _windows_native_tar_enabled() and self._remote_is_msys():
+            # MSYS programs (Git Bash tar, cat, dd) intermittently fail reading a Win32-OpenSSH stdin
+            # pipe ("Cannot read: Bad address") and can be left spinning; the native bsdtar reads it
+            # reliably. --no-overwrite-dir guards POSIX home modes and has no Windows meaning.
+            return (f'"$(cygpath -u "$SYSTEMROOT")/System32/tar.exe" -xf - '
+                    f'-C "$(cygpath -w {shlex.quote(base)})"')
+        # --no-overwrite-dir keeps tar from stamping the staging dir's mode onto
+        # existing dirs (e.g. /home/<user>); a umask-002 0775 home breaks sshd StrictModes.
+        return f"tar xf - --no-overwrite-dir -C {shlex.quote(base)}"
+
     def _ssh_bulk_upload(self, files: list[tuple[str, str]]) -> None:
         """Upload many files in one tar-over-SSH stream: local ``tar c`` piped through one SSH
         connection to remote ``tar x``, after a single batched ``mkdir -p``."""
@@ -263,9 +296,7 @@ class SSHEnvironment(BaseEnvironment):
                         raise
                     shutil.copy2(host_path, staged)
 
-            # --no-overwrite-dir keeps tar from stamping the staging dir's mode onto
-            # existing dirs (e.g. /home/<user>); a umask-002 0775 home breaks sshd StrictModes.
-            ssh_cmd = self._build_ssh_command() + [f"tar xf - --no-overwrite-dir -C {shlex.quote(base)}"]
+            ssh_cmd = self._build_ssh_command() + [self._remote_extract_command(base)]
             tar_proc = subprocess.Popen(["tar", "-chf", "-", "-C", staging, "."], stdin=subprocess.DEVNULL,
                                         stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             try:
